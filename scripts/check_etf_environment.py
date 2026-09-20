@@ -14,15 +14,21 @@ from __future__ import annotations
 
 import argparse
 import importlib.metadata
+import importlib.util
+import contextlib
+import io
+import json
+import re
 import os
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
 
 
 DEFAULT_DATA_PATH = r"D:\qlib_data\etf_qlib_data"
+DEFAULT_DOCKER_IMAGE = "rdagent-qlib@sha256:97e456451ae9b3aa7c74456cf76afa2a6fd336b7b7cc96c5b98416a4de0bc373"
 REQUIRED_MODEL_SETTINGS = (
     "CHAT_MODEL",
     "EMBEDDING_MODEL",
@@ -135,6 +141,7 @@ def smoke_train(data_path: Path) -> Check:
         )
         original_dir = Path.cwd()
         with tempfile.TemporaryDirectory(prefix="etf_qlib_smoke_") as temp_dir:
+            original_tracking_uri = os.environ.get("MLFLOW_TRACKING_URI")
             os.environ["MLFLOW_TRACKING_URI"] = str(Path(temp_dir) / "mlruns")
             os.chdir(temp_dir)
             try:
@@ -143,7 +150,10 @@ def smoke_train(data_path: Path) -> Check:
                 prediction = model.predict(dataset, segment="valid")
             finally:
                 os.chdir(original_dir)
-                os.environ.pop("MLFLOW_TRACKING_URI", None)
+                if original_tracking_uri is None:
+                    os.environ.pop("MLFLOW_TRACKING_URI", None)
+                else:
+                    os.environ["MLFLOW_TRACKING_URI"] = original_tracking_uri
         if prediction.empty or prediction.isna().any():
             return Check("Qlib LGB training smoke test", "FAIL", "Prediction is empty or contains missing values.")
         return Check("Qlib LGB training smoke test", "PASS", f"30 instruments; {len(prediction)} validation predictions")
@@ -179,16 +189,20 @@ def check_python_dependencies() -> Check:
         return Check("Python dependency integrity", "WARN", f"{type(exc).__name__}: {exc}")
 
 
-def check_docker_qlib(data_path: Path) -> Check:
+def check_docker_qlib(data_path: Path, image: str = DEFAULT_DOCKER_IMAGE) -> Check:
+    if not re.fullmatch(r"[^\s]+@sha256:[a-f0-9]{64}", image):
+        return Check("Docker-mounted ETF Qlib", "FAIL", "An explicit immutable Docker image digest is required.")
     command = [
         "docker",
         "run",
         "--rm",
+        "--pull", "never",
+        "--network", "none",
         "--mount",
         f"type=bind,source={data_path},target=/etf_qlib_data,readonly",
         "-e",
         "QLIB_PROVIDER_URI=/etf_qlib_data",
-        "rdagent-qlib:latest",
+        image,
         "python",
         "-c",
         (
@@ -206,42 +220,60 @@ def check_docker_qlib(data_path: Path) -> Check:
 
 
 def check_rdagent(settings: set[str]) -> list[Check]:
-    checks = [Check("RD-Agent", "PASS", f"rdagent {package_version('rdagent')}")]
+    version = package_version("rdagent")
+    checks = [Check("RD-Agent", "FAIL" if version == "missing" else "PASS", f"rdagent {version}")]
     missing_model = [name for name in REQUIRED_MODEL_SETTINGS if name not in settings]
     has_credential = any(name in settings for name in OPTIONAL_CREDENTIAL_SETTINGS)
     if missing_model or not has_credential:
         missing = missing_model + ([] if has_credential else ["a provider credential"])
         checks.append(Check("RD-Agent model configuration", "WARN", "Missing: " + ", ".join(missing)))
     else:
-        checks.append(Check("RD-Agent model configuration", "PASS", "Model and provider credentials are configured."))
+        checks.append(Check("RD-Agent model configuration", "PASS", "Model and provider credentials are configured; no API request made."))
     try:
-        from rdagent.utils.env import QlibCondaConf
-
-        default_name = QlibCondaConf().conda_env_name
-        detail = f"Default Qlib runner environment: {default_name}"
-        if default_name != "qlib_zhengshi":
-            detail += "; requires an ETF adapter to reuse qlib_zhengshi"
-        checks.append(Check("RD-Agent ETF adapter", "WARN", detail))
+        # Bootstrap is lazy. Do not initialize the RDAgent settings singleton or
+        # overwrite process settings merely to inspect installed extensions.
+        from etf_ml.adapters.rdagent.bootstrap import EXTENSIONS
+        absent = [path for path in EXTENSIONS.values()
+                  if importlib.util.find_spec(path.rsplit(".", 1)[0]) is None]
+        if absent:
+            checks.append(Check("RD-Agent ETF adapter availability", "FAIL", "Missing installed ETF extension modules."))
+        else:
+            checks.append(Check("RD-Agent ETF adapter availability", "PASS",
+                                "ETF extension modules found; default Conda runner name does not determine adapter availability. Runtime contracts require tests."))
     except Exception as exc:
-        checks.append(Check("RD-Agent ETF adapter", "FAIL", f"{type(exc).__name__}: {exc}"))
+        checks.append(Check("RD-Agent ETF adapter availability", "WARN",
+                            f"Project adapter not inspectable ({type(exc).__name__}); install etf-ml or set PYTHONPATH=src."))
     return checks
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-path", default=os.getenv("ETF_QLIB_PROVIDER_URI", DEFAULT_DATA_PATH))
-    parser.add_argument("--smoke-train", action="store_true", help="Run a small Alpha158 + LGBModel training job.")
-    parser.add_argument("--docker-qlib", action="store_true", help="Verify the rdagent-qlib image can read the ETF dataset read-only.")
-    args = parser.parse_args()
-    data_path = Path(args.data_path)
+def framework_report(config_path: Path | None, data_path: Path) -> dict:
+    report = {"status": "not_assessed", "gate_states": {f"G{i}": "not_assessed" for i in range(5)},
+              "g0_passed": False, "external_calls": 0, "training_runs": 0,
+              "note": "Environment and smoke checks do not prove framework or investment gates."}
+    if config_path is None:
+        return report
+    try:
+        from etf_ml.config import load_config
+        from etf_ml.research.readiness import first_loop_readiness
+        config = load_config(config_path, {"data": {"source": data_path}})
+        readiness = first_loop_readiness(config)
+        report["readiness"] = readiness
+        report["status"] = "blocked_preflight" if readiness["blockers"] else "needs_full_validation"
+        report["gate_states"]["G0"] = report["status"]
+    except Exception as exc:
+        report["status"] = "invalid_configuration"
+        report["error_type"] = type(exc).__name__
+    return report
 
+
+def collect_environment_checks(args, data_path):
     checks = [
         Check("Python", "PASS", sys.version.split()[0]),
         Check("pyqlib", "PASS" if package_version("pyqlib") != "missing" else "FAIL", package_version("pyqlib")),
     ]
     if not data_path.is_dir():
         checks.append(Check("ETF data directory", "FAIL", f"Not found: {data_path}"))
-        instruments: list[str] = []
+        instruments = []
     else:
         checks.append(Check("ETF data directory", "PASS", str(data_path)))
         qlib_check, instruments = check_qlib(data_path)
@@ -250,14 +282,42 @@ def main() -> int:
     checks.append(check_python_dependencies())
     checks.append(check_docker())
     if args.docker_qlib and data_path.is_dir():
-        checks.append(check_docker_qlib(data_path))
+        checks.append(check_docker_qlib(data_path, args.docker_image))
     checks.extend(check_rdagent(configured_settings()))
     if args.smoke_train and instruments:
         checks.append(smoke_train(data_path))
+    return checks
 
-    for check in checks:
-        print(f"[{check.state}] {check.name}: {check.detail}")
-    return 1 if any(check.state == "FAIL" for check in checks) else 0
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-path", default=os.getenv("ETF_QLIB_PROVIDER_URI", DEFAULT_DATA_PATH))
+    parser.add_argument("--config", type=Path, help="Also inspect framework configuration without running G0-G4.")
+    parser.add_argument("--json", action="store_true", help="Emit a single JSON report with separate environment and framework status.")
+    parser.add_argument("--smoke-train", action="store_true", help="Run a small Alpha158 + LGBModel training job; does not establish G1.")
+    parser.add_argument("--docker-qlib", action="store_true", help="Verify the fixed local image reads ETF data read-only, with no network or pull.")
+    parser.add_argument("--docker-image", default=DEFAULT_DOCKER_IMAGE)
+    args = parser.parse_args(argv)
+    data_path = Path(args.data_path)
+    # Third-party imports can print to stdout. Keep machine-readable output
+    # complete and never echo captured import or settings output.
+    with contextlib.redirect_stdout(io.StringIO()) if args.json else contextlib.nullcontext():
+        checks = collect_environment_checks(args, data_path)
+        framework = framework_report(args.config, data_path)
+    environment_status = "failed" if any(c.state == "FAIL" for c in checks) else "warning" if any(c.state == "WARN" for c in checks) else "passed"
+    report = {"environment": {"status": environment_status, "checks": [asdict(c) for c in checks]}, "framework": framework}
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False))
+    else:
+        for check in checks:
+            print(f"[{check.state}] {check.name}: {check.detail}")
+        print("Framework gates: " + ", ".join(f"{k}={v}" for k, v in framework["gate_states"].items()))
+        print(framework["note"])
+    if environment_status == "failed":
+        return 1
+    if framework["status"] == "invalid_configuration":
+        return 2
+    return 5 if framework["status"] == "blocked_preflight" else 0
 
 
 if __name__ == "__main__":

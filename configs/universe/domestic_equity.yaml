@@ -1,0 +1,5 @@
+universe:
+  allowed_asset_class: domestic_equity
+  minimum_listing_days: 60
+  liquidity_lookback: 20
+  minimum_average_amount: 0

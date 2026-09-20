@@ -1,0 +1,7 @@
+models:
+  - name: ridge
+    constructor:
+      estimator: ridge
+      alpha: 1.0
+      fit_intercept: true
+      include_valid: false

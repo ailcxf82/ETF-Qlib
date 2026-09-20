@@ -1,5 +1,11 @@
 .env
 mlruns/
+.etf-recorders/
 selector.log
 __pycache__/
 *.py[cod]
+artifacts/
+.pytest_cache/
+*.egg-info/
+build/
+dist/

@@ -1,0 +1,1 @@
+{"basis":"source_documented_schedule","local_time":"09:25:00","timezone":"Asia/Shanghai","explanation":"Tushare etf_limit documents an approximately 08:40 daily update. Historical engineering policy assumes availability by 09:25 Shanghai; individual historical receipt times are not asserted. Real-time inputs must use recorded_receipt."}

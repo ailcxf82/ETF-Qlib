@@ -1,0 +1,10 @@
+data:
+  source: D:/qlib_data/etf_qlib_data
+  benchmark_id: CSI300
+  # Supply authoritative calendar, units, price convention and PIT metadata.
+  trusted_calendar: null
+  volume_unit: null
+  amount_multiplier: null
+  price_mode: null
+  change_unit: null
+  point_in_time_metadata: false

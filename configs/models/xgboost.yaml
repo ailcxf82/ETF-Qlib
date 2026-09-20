@@ -1,0 +1,10 @@
+models:
+  - name: xgboost
+    seed: 42
+    constructor:
+      max_depth: 4
+      eta: 0.03
+      nthread: 4
+    fit:
+      num_boost_round: 500
+      early_stopping_rounds: 50

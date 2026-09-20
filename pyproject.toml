@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "etf-ml"
+version = "0.1.0"
+description = "Versioned ETF research, Qlib models and constrained portfolios"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "numpy==1.26.4", "pandas==2.3.3", "pyarrow==22.0.0",
+  "pydantic==2.13.4", "PyYAML==6.0.3", "scikit-learn==1.8.0",
+  "pyqlib==0.9.7", "lightgbm==4.6.0", "psutil>=5.9,<8", "tables==3.11.1",
+]
+
+[project.optional-dependencies]
+research = ["rdagent==0.8.0"]
+xgboost = ["xgboost==3.2.0"]
+test = ["pytest==9.0.3"]
+
+[project.scripts]
+etf-ml = "etf_ml.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
+markers = [
+  "qlib: integration against installed Qlib and LightGBM",
+  "docker: requires a running Docker daemon and pinned image",
+  "live: explicitly enabled external services or real data",
+]

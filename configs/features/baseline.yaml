@@ -1,0 +1,4 @@
+label:
+  horizon: 5
+  execution_lag: 1
+  price_column: adj_open

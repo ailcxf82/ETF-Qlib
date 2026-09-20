@@ -1,0 +1,27 @@
+# Verified local CSV/bin identity, not a qualified G0 snapshot.
+# Evidence: 127efea309e9a9741e57f8893d33632c9f8a8b2947db8f34d1ebfd15dbcd4199
+# Calendar: b2e86cde671f974ee89f4f7e9f982d86e50d9c430fae4ad1c767a8c9b325ea4c
+# See docs/07-data-source-evidence.md. Opt-in only; other G0 gaps still block.
+data:
+  source: D:/qlib_data/etf_qlib_data
+  volume_unit: lots
+  lot_size: 100
+  amount_multiplier: 1000
+  price_mode: raw
+  change_unit: percent
+  benchmark_id: CSI300
+  trusted_calendar: D:/quant_project/ETF-Qlib/artifacts/data_evidence/b2e86cde671f974ee89f4f7e9f982d86e50d9c430fae4ad1c767a8c9b325ea4c/trusted_calendar.txt
+  point_in_time_metadata: false
+  metadata_path: null
+  events_path: null
+  benchmark_path: null
+  fields:
+    open: open
+    high: high
+    low: low
+    close: close
+    volume: volume
+    amount: amount
+    change: pct_chg
+    factor: factor
+    reference_close: pre_close

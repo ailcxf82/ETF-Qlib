@@ -1,0 +1,26 @@
+# Verified local CSV/bin identity, not a qualified G0 snapshot.
+# Evidence: 127efea309e9a9741e57f8893d33632c9f8a8b2947db8f34d1ebfd15dbcd4199
+# See docs/07-data-source-evidence.md. This file is opt-in; no default changes.
+data:
+  source: D:/qlib_data/etf_qlib_data
+  volume_unit: lots
+  lot_size: 100
+  amount_multiplier: 1000
+  price_mode: raw
+  change_unit: percent
+  benchmark_id: CSI300
+  trusted_calendar: null
+  point_in_time_metadata: false
+  metadata_path: null
+  events_path: null
+  benchmark_path: null
+  fields:
+    open: open
+    high: high
+    low: low
+    close: close
+    volume: volume
+    amount: amount
+    change: pct_chg
+    factor: factor
+    reference_close: pre_close

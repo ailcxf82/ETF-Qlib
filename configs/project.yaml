@@ -1,0 +1,30 @@
+# K/liquidity defaults delegated by user; maximum drawdown fixed at 12%.
+data:
+  source: D:/qlib_data/etf_qlib_data
+  trusted_calendar: null
+  volume_unit: null
+  amount_multiplier: null
+  price_mode: null
+  change_unit: null
+  point_in_time_metadata: false
+portfolio:
+  initial_cash: 500000
+  k: 0.05
+  k_mode: fraction
+  commission_rate: 0.003
+  minimum_commission: null
+  slippage_rate: 0.0003
+  liquidity: 0.2
+  liquidity_mode: participation
+  risk: 0.12
+  risk_mode: max_drawdown
+  schedule: mid_month_month_end
+  mid_month_day: 15
+  liquidity_lookback: 20
+research:
+  budget_mode: null
+  api_budget: null
+  max_trials: 1
+validation:
+  holdout_start: '2026-01-01'
+  holdout_independent: false

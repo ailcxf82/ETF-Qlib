@@ -1,0 +1,14 @@
+# K/liquidity defaults delegated by user; maximum drawdown fixed at 12%.
+portfolio:
+  initial_cash: 500000
+  k: 0.05
+  k_mode: fraction
+  commission_rate: 0.003
+  minimum_commission: null
+  slippage_rate: 0.0003
+  liquidity: 0.2
+  liquidity_mode: participation
+  risk: 0.12
+  risk_mode: max_drawdown
+  schedule: mid_month_month_end
+  liquidity_lookback: 20

@@ -1,0 +1,6 @@
+# The default loader supplies the five documented expanding-window folds.
+validation:
+  holdout_start: '2026-01-01'
+  holdout_independent: false
+  annualization_days: 252
+  prediction_tolerance: 0.00000001
