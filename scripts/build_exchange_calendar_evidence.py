@@ -10,7 +10,7 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
-import time
+import uuid
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
@@ -97,7 +97,7 @@ def publish(output, report, blobs, calendar):
             if (destination / 'trusted_calendar.txt').read_text(encoding='utf-8') != calendar:
                 raise IntegrityError('Combined archived calendar changed')
         else:
-            stage = ensure_within(output / ('.calendar-stage-' + str(os.getpid()) + '-' + str(time.time_ns())), output)
+            stage = ensure_within(output / ('.calendar-stage-' + str(os.getpid()) + '-' + uuid.uuid4().hex), output)
             stage.mkdir()
             for name, raw in blobs.items():
                 path = ensure_within(stage / name, stage)

@@ -6,6 +6,41 @@ import pandas as pd
 from etf_ml.errors import QualityError
 
 
+def moving_block_mean_uncertainty(values, *, block_length=20, repetitions=1000,
+                                  confidence=.95, seed=42) -> dict:
+    """Development-only moving-block intervals for a daily signal statistic."""
+    values = np.asarray(values, dtype=float)
+    if (values.ndim != 1 or not len(values) or not np.isfinite(values).all() or
+            block_length < 1 or repetitions < 100 or not 0 < confidence < 1):
+        raise QualityError("Invalid daily signal series or block statistics settings")
+    mean = float(values.mean())
+    std = float(values.std(ddof=1)) if len(values) > 1 else None
+    ir = mean / std if std is not None and std > 0 else None
+    common = {"effective_dates": len(values), "block_length": block_length,
+              "repetitions": repetitions, "confidence": confidence, "seed": seed,
+              "mean": mean, "information_ratio": ir,
+              "note": "Development diagnostic; repeated selection bias is not removed"}
+    if len(values) < 3 * block_length:
+        return {"status": "inconclusive", **common,
+                "reason": "insufficient_time_blocks", "mean_confidence_interval": None,
+                "information_ratio_confidence_interval": None}
+    rng = np.random.default_rng(seed)
+    starts = rng.integers(0, len(values) - block_length + 1,
+                          size=(repetitions, int(np.ceil(len(values) / block_length))))
+    indices = (starts[..., None] + np.arange(block_length)).reshape(repetitions, -1)[:, :len(values)]
+    samples = values[indices]
+    means = samples.mean(axis=1)
+    stds = samples.std(axis=1, ddof=1)
+    ratios = np.divide(means, stds, out=np.full_like(means, np.nan), where=stds > 0)
+    tail = (1 - confidence) / 2
+    return {"status": "completed", **common,
+            "mean_confidence_interval": np.quantile(means, [tail, 1 - tail]).tolist(),
+            "information_ratio_confidence_interval": (
+                np.quantile(ratios[np.isfinite(ratios)], [tail, 1 - tail]).tolist()
+                if np.isfinite(ratios).any() else None),
+            "available_block_starts": len(values) - block_length + 1}
+
+
 def paired_block_uncertainty(baseline: pd.Series, candidate: pd.Series, *,
                              block_length: int = 20, repetitions: int = 1000,
                              confidence: float = .95, seed: int = 42,

@@ -35,7 +35,16 @@ for cutoff_position in cutoff_positions:
     perturbed = panel.copy()
     columns = list(perturbed.select_dtypes(include=[np.number]).columns)
     perturbed[columns] = perturbed[columns].astype(float)
-    perturbed.loc[~past_mask, columns] = perturbed.loc[~past_mask, columns] * 1.73 + 23
+    # Keep the perturbation bounded and non-uniform.  Extremely large shifts
+    # trigger numerical instability in pandas' rolling skew/kurt kernels and
+    # can make a causal historical window appear to change.  The row-specific
+    # change still exposes candidate code that reads observations after the
+    # cutoff, including cross-sectional transforms.
+    future = perturbed.loc[~past_mask, columns]
+    pattern = pd.Series(np.linspace(-0.01, 0.01, len(future)), index=future.index)
+    perturbed.loc[~past_mask, columns] = future.mul(1.01 + pattern, axis=0).add(
+        0.01 * pattern, axis=0
+    )
     future_result = compute(perturbed)
     assert_frame_equal(full.loc[truncated.index], future_result.loc[truncated.index],
                        check_exact=False, rtol=1e-10, atol=1e-10)

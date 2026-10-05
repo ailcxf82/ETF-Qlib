@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from pydantic import Field, model_validator
+from typing import Literal
+
+from pydantic import Field, model_serializer, model_validator
 
 from etf_ml.artifacts import environment_manifest
 from etf_ml.contracts import (StrictSpec, LabelSpec, ModelSpec, PortfolioPolicy,
@@ -22,11 +24,21 @@ class ComparisonProtocol(StrictSpec):
     benchmarks: BenchmarkPolicy = Field(default_factory=BenchmarkPolicy)
     cost_multipliers: list[float] = Field(default_factory=lambda: [2.0])
     stress_min_excess_return: float | None = None
+    factor_signal_rule: Literal["strict_majority"] = "strict_majority"
     time_block_length: int = Field(default=20, gt=0)
     bootstrap_repetitions: int = Field(default=1000, ge=100)
     bootstrap_seed: int = 42
     environment: dict = Field(default_factory=environment_manifest)
     source_code_hash: str = Field(default_factory=code_hash)
+    # Explicit on new protocols; absent legacy protocols retain their original identity.
+    evaluation_code_hash: str | None = None
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_identity(self, handler):
+        value = handler(self)
+        if self.evaluation_code_hash is None:
+            value.pop("evaluation_code_hash", None)
+        return value
 
     @model_validator(mode="after")
     def check_matrix(self):

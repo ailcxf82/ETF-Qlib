@@ -7,7 +7,7 @@ from pathlib import Path
 
 from etf_ml.errors import ConfigurationError, IntegrityError, QualityError
 from etf_ml.research.context import FactorSpec
-from etf_ml.utils import FileLock, atomic_json, content_hash, ensure_within, file_hash
+from etf_ml.utils import FileLock, atomic_json, content_hash, ensure_within, file_hash, filesystem_path
 
 TRANSITIONS = {
     "proposed": {"validated", "rejected"},
@@ -62,6 +62,7 @@ class FactorRegistry:
             path.mkdir(parents=True, exist_ok=False)
             (path / "source.py").write_text(spec.source, encoding="utf-8")
             atomic_json(path / "spec.json", spec.model_dump(mode="json"))
+            (path / "events").mkdir(parents=True, exist_ok=True)
             definition = {
                 "schema_version": 1, "factor_id": spec.factor_id, "version": spec.version,
                 "version_id": spec.version_id, "lineage": lineage,
@@ -85,17 +86,17 @@ class FactorRegistry:
 
     def load(self, factor_id: str, version: int) -> dict:
         path = self._path(factor_id, version)
-        head = json.loads((path / "head.json").read_text(encoding="utf-8"))
+        head = json.loads(filesystem_path(path / "head.json").read_text(encoding="utf-8"))
         if file_hash(path / "definition.json") != head["definition_hash"]:
             raise IntegrityError("Factor definition integrity failed")
-        definition = json.loads((path / "definition.json").read_text(encoding="utf-8"))
+        definition = json.loads(filesystem_path(path / "definition.json").read_text(encoding="utf-8"))
         if definition["factor_id"] != factor_id or definition["version"] != version:
             raise IntegrityError("Factor identity mismatch")
         for name, expected in definition["files"].items():
             target = ensure_within(path / name, path)
             if file_hash(target) != expected:
                 raise IntegrityError("Registered factor source or specification changed")
-        spec = FactorSpec.model_validate_json((path / "spec.json").read_text(encoding="utf-8"))
+        spec = FactorSpec.model_validate_json(filesystem_path(path / "spec.json").read_text(encoding="utf-8"))
         if spec.version_id != definition["version_id"]:
             raise IntegrityError("Factor version identity mismatch")
         events, event_id, seen = [], head["event_id"], set()
@@ -104,7 +105,7 @@ class FactorRegistry:
                 raise IntegrityError("Factor history cycle")
             seen.add(event_id)
             target = ensure_within(path / "events" / (event_id + ".json"), path)
-            event = json.loads(target.read_text(encoding="utf-8"))
+            event = json.loads(filesystem_path(target).read_text(encoding="utf-8"))
             if content_hash(event) != event_id:
                 raise IntegrityError("Factor history integrity failed")
             for item in event["evidence"].values():
@@ -136,7 +137,7 @@ class FactorRegistry:
             if state in ("rejected", "retired") and not reasons:
                 raise QualityError("Rejected or retired versions require an explicit reason")
             evidence = dict(evidence or {})
-            evidence_bytes = {kind: Path(source).read_bytes() for kind, source in evidence.items()}
+            evidence_bytes = {kind: filesystem_path(Path(source)).read_bytes() for kind, source in evidence.items()}
             required = REQUIRED_EVIDENCE.get(state)
             if required and required not in evidence:
                 raise QualityError("Missing decision evidence: " + required)
@@ -168,17 +169,17 @@ class FactorRegistry:
                 import hashlib
                 digest = hashlib.sha256(raw).hexdigest()
                 destination = path / "evidence" / (digest + ".json")
-                destination.parent.mkdir(exist_ok=True)
-                if not destination.exists():
+                filesystem_path(destination.parent).mkdir(parents=True, exist_ok=True)
+                if not filesystem_path(destination).exists():
                     temporary = destination.with_name(f".{digest}.{os.getpid()}.tmp")
                     try:
-                        with temporary.open("wb") as stream:
+                        with filesystem_path(temporary).open("wb") as stream:
                             stream.write(raw)
                             stream.flush()
                             os.fsync(stream.fileno())
-                        os.replace(temporary, destination)
+                        os.replace(filesystem_path(temporary), filesystem_path(destination))
                     finally:
-                        temporary.unlink(missing_ok=True)
+                        filesystem_path(temporary).unlink(missing_ok=True)
                 if file_hash(destination) != digest:
                     raise IntegrityError("Evidence copy integrity failed")
                 stored[kind] = {"path": destination.relative_to(path).as_posix(), "sha256": digest}

@@ -1,5 +1,3 @@
-from dataclasses import replace
-
 import pandas as pd
 import pytest
 
@@ -44,6 +42,35 @@ def test_G2_real_isolated_factor_execution_and_cache(candidate_setup, tmp_path):
     assert "future_perturbation_invariance" in artifact.manifest["checks"]["checks"]
     cached = engine.materialize(spec, context, snapshot.path / "research")
     pd.testing.assert_frame_equal(artifact.frame, cached.frame)
+
+
+def test_G2_accepts_causal_rolling_skew_under_bounded_future_perturbation(candidate_setup, tmp_path):
+    """Regression for pandas rolling-skew instability under extreme test data."""
+    snapshot, context, policy, spec = candidate_setup
+    spec.factor_id = "skewness_twenty"
+    spec.lookback = 20
+    spec.minimum_observations = 20
+    spec.source = (
+        "def compute(panel):\n"
+        "    value = panel['return_1d']\n"
+        "    result = value.groupby(level='instrument').transform(\n"
+        "        lambda item: item.rolling(20, min_periods=20).skew()\n"
+        "    )\n"
+        "    return result.to_frame('factor')\n")
+    artifact = FactorEngine(tmp_path / "workspaces", policy).materialize(
+        spec, context, snapshot.path / "research"
+    )
+    assert "future_perturbation_invariance" in artifact.manifest["checks"]["checks"]
+
+
+def test_G2_rejects_future_rolling_that_static_checks_cannot_prove(candidate_setup, tmp_path):
+    snapshot, context, policy, spec = candidate_setup
+    spec.source = (
+        "def compute(panel):\n"
+        "    value = panel['adj_close']\n"
+        "    return value.iloc[::-1].rolling(5, min_periods=5).mean().iloc[::-1].to_frame('factor')\n")
+    with pytest.raises(QualityError):
+        FactorEngine(tmp_path / "workspaces", policy).materialize(spec, context, snapshot.path / "research")
 
 @pytest.mark.parametrize("source", [
     "def compute(panel):\n    return panel['adj_close'].shift(-1).to_frame('factor')\n",

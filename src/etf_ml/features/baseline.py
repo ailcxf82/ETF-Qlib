@@ -10,6 +10,51 @@ from etf_ml.errors import QualityError
 from etf_ml.utils import content_hash
 
 
+def feature_descriptors(columns: list[str], *, composition: dict | None = None) -> list[dict]:
+    """Audited compact baseline catalogue used in v2 proposal prompts."""
+    descriptors = []
+    accumulated = {str(entry.get("column")): entry for entry in (composition or {}).get("factors", [])
+                   if isinstance(entry, dict)}
+    for name in sorted(columns):
+        # Only exact built-in IDs are parsed.  An admitted factor commonly has
+        # a `<factor_id>_vN` column and must be described from its verified
+        # composition spec rather than guessed from a name prefix.
+        if name in accumulated:
+            spec = accumulated[name].get("spec", {})
+            formula, group = spec.get("formula"), spec.get("research_group")
+            if not isinstance(formula, str) or not formula or not isinstance(group, str) or not group:
+                raise QualityError("Accumulated feature descriptor lacks verified specification")
+            descriptors.append({"feature_id": name, "formula": formula, "group": group,
+                                "definition_hash": content_hash({"column": name, "spec": spec})})
+            continue
+        if name in {"momentum_1", "momentum_5", "momentum_10", "momentum_20", "momentum_60", "momentum_120"}:
+            window = int(name.rsplit("_", 1)[1])
+            formula, group = f"adj_close / adj_close.shift({window}) - 1", "trend"
+        elif name in {"reversal_5", "reversal_20"}:
+            window = int(name.rsplit("_", 1)[1])
+            formula, group = f"-(adj_close / adj_close.shift({window}) - 1)", "reversal"
+        elif name in {"volatility_10", "volatility_20", "volatility_60"}:
+            window = int(name.rsplit("_", 1)[1])
+            formula, group = f"rolling_std(adj_close.pct_change(), {window})", "volatility"
+        elif name in {"intraday_return", "daily_range", "average_range_20"}:
+            formula, group = name, "range"
+        elif name in {"price_location_20", "price_location_60"}:
+            window = int(name.rsplit("_", 1)[1])
+            formula, group = f"(adj_close - rolling_min(adj_low, {window})) / range({window})", "trend"
+        elif name in {"volume_ratio_5_20", "amount_ratio_5_20", "log_average_amount_20", "illiquidity_20"}:
+            formula, group = name, "liquidity"
+        else:
+            # Preserve every column in the catalogue without inventing its
+            # formula.  Unknown columns are visibly unavailable to proposal
+            # generation rather than silently disappearing.
+            descriptors.append({"feature_id": name, "formula": None, "group": "unverified",
+                                "definition_hash": content_hash({"name": name, "state": "unverified"})})
+            continue
+        descriptors.append({"feature_id": name, "formula": formula, "group": group,
+                            "definition_hash": content_hash({"name": name, "formula": formula})})
+    return descriptors
+
+
 def baseline_features(panel: pd.DataFrame) -> pd.DataFrame:
     require_panel(panel)
     required = {"adj_open", "adj_high", "adj_low", "adj_close",

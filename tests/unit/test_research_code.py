@@ -73,3 +73,23 @@ def test_groupby_rolling_source_rejected_before_container_execution():
 
 def test_groupby_transform_rolling_source_allowed():
     validate_source("def compute(panel):\n    return panel['adj_close'].groupby(level='instrument').transform(lambda x: x.rolling(5).mean())")
+
+
+def test_proposal_prompt_requires_the_converter_envelope():
+    from etf_ml.adapters.rdagent.proposal import PROPOSAL_SYSTEM
+    assert '"factors"' in PROPOSAL_SYSTEM
+    assert 'bare factor' in PROPOSAL_SYSTEM
+    assert 'failure_conditions must be a JSON list' in PROPOSAL_SYSTEM
+    assert 'minimum_observations must be a positive integer' in PROPOSAL_SYSTEM
+    assert 'never use a numeric sign' in PROPOSAL_SYSTEM
+
+
+def test_llm_worker_disables_rdagent_object_storage_without_replacing_logger():
+    from types import SimpleNamespace
+    from etf_ml.research.llm_worker import disable_rdagent_disk_logging
+
+    logger = SimpleNamespace(storage=object(), other_storages=[object()], _tag="kept")
+    disable_rdagent_disk_logging(logger)
+    assert logger._tag == "kept"
+    assert logger.other_storages == []
+    assert logger.storage.log("settings", tag="LITELLM_SETTINGS") is None

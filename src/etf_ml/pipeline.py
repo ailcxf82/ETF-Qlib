@@ -21,7 +21,9 @@ from etf_ml.utils import atomic_json, content_hash, file_hash, FileLock
 def run_baseline(config: AppConfig, snapshot_path: Path, output: Path, *,
                  run_id: str, feature_override: FeatureArtifact | None = None,
                  protocol_id: str | None = None,
-                 cost_multipliers: tuple[float, ...] = (2.0,)) -> dict:
+                 cost_multipliers: tuple[float, ...] = (2.0,),
+                 progress=None, progress_fields: dict | None = None,
+                 auxiliary_cache_root: Path | None = None) -> dict:
     config.portfolio.require_resolved()
     if not config.models or not config.validation.folds:
         raise ConfigurationError("Baseline requires models and explicit development folds")
@@ -75,6 +77,7 @@ def run_baseline(config: AppConfig, snapshot_path: Path, output: Path, *,
     labels, label_events = generate_labels(panel, calendar, config.label)
     label_events.to_parquet(output / "label_events.parquet")
     rows, auxiliary = [], []
+    total_models = len(config.validation.folds) * len(config.models)
     for fold in config.validation.folds:
         valid_days = calendar[(calendar >= pd.Timestamp(fold.selection.start)) &
                               (calendar <= pd.Timestamp(fold.selection.end))]
@@ -89,6 +92,10 @@ def run_baseline(config: AppConfig, snapshot_path: Path, output: Path, *,
                   "risk_free_rate": config.validation.risk_free_rate}
         evaluation_index = None
         for spec in config.models:
+            if progress:
+                progress.emit("model_started", fold=fold.name, model=spec.name,
+                              completed_models=len(rows), total_models=total_models,
+                              **(progress_fields or {}))
             identity = (f"{run_id[:24]}-{fold.name[:16]}-{spec.name}-" +
                         content_hash({"parent_run_id": run_id, "fold": fold.name, "model": spec})[:16])
             prepared = build(feature_set, labels, label_events, fold,
@@ -120,13 +127,26 @@ def run_baseline(config: AppConfig, snapshot_path: Path, output: Path, *,
                    "model_path": str(model_path),
                    "model_manifest_hash": file_hash(model_path / "manifest.json"),
                    "recorder_uri": str(recorder_uri), "portfolio": result.metrics,
+                   # Immutable local evidence used by development-only V2
+                   # diagnostics; it is not used by selection gates.
+                   "backtest_path": str(fold_path),
                    "predictive": predictive, "dataset": prepared.manifest}
             atomic_json(fold_path / "metrics.json", row)
             rows.append(row)
+            if progress:
+                progress.emit("model_completed", fold=fold.name, model=spec.name,
+                              completed_models=len(rows), total_models=total_models,
+                              **(progress_fields or {}))
+        if progress:
+            progress.emit("auxiliary_started", fold=fold.name, **(progress_fields or {}))
         auxiliary.extend(run_auxiliary(config, panel, calendar, universe, fold=fold,
             snapshot_id=snapshot.snapshot_id, protocol_id=protocol_id, labels=labels,
             evaluation_index=evaluation_index, output=output / fold.name / "auxiliary",
-            cost_multipliers=cost_multipliers, **common))
+            cost_multipliers=cost_multipliers, cache_root=auxiliary_cache_root,
+            progress=progress, progress_fields=progress_fields, **common))
+        if progress:
+            progress.emit("fold_completed", fold=fold.name, completed_models=len(rows),
+                          total_models=total_models, **(progress_fields or {}))
     report = {"status": "completed", "research_passed": None,
               "qualification": snapshot.manifest.get("qualification", {"mode": "formal"}),
               "snapshot_id": snapshot.snapshot_id, "feature_set_id": feature_set.feature_set_id,

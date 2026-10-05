@@ -33,6 +33,16 @@ def test_all_frozen_acceptance_limits_and_pressure_pass(acceptance):
     assert reasons(config, base, {"3.0": copy.deepcopy(base)}) == []
 
 
+def test_holdout_acceptance_uses_drawdown_cap_not_earlier_trigger(acceptance):
+    config, metrics = acceptance
+    config.portfolio.risk = .08
+    config.portfolio.max_drawdown_limit = .12
+    config.acceptance.maximum_drawdown = .12
+    metrics["max_drawdown"] = .11
+    assert "base:portfolio_risk_limit" not in reasons(config, metrics, {"3.0": copy.deepcopy(metrics)})
+    assert "base:drawdown_threshold" not in reasons(config, metrics, {"3.0": copy.deepcopy(metrics)})
+
+
 @pytest.mark.parametrize("field,value,reason", [("max_drawdown", .11, "drawdown_threshold"),
     ("annualized_volatility", .21, "volatility_threshold"), ("execution_cost_over_initial_equity", .06, "execution_cost_threshold"),
     ("effective_dates", 19, "insufficient_effective_dates"), ("max_single_weight", .51, "single_weight_limit"),
@@ -111,10 +121,14 @@ def test_usage_claim_and_audit_history_corruption_is_rejected(usage):
     atomic_json(claim_path, payload)
     with pytest.raises(IntegrityError): store.claim(identity, run_id="audit")
 
-def test_holdout_parser_requires_only_complete_frozen_model_package():
+def test_holdout_parser_requires_frozen_model_and_access_review():
     from etf_ml.cli import parser
-    parsed = parser().parse_args(["evaluate-holdout", "--frozen-model", "frozen-package"])
+    with pytest.raises(SystemExit):
+        parser().parse_args(["evaluate-holdout", "--frozen-model", "frozen-package"])
+    parsed = parser().parse_args(["evaluate-holdout", "--frozen-model", "frozen-package",
+                                 "--holdout-access-audit", "review.json"])
     assert str(parsed.frozen_model) == "frozen-package"
+    assert str(parsed.holdout_access_audit) == "review.json"
     assert not hasattr(parsed, "frozen_features")
 
 def test_unconfirmed_independence_fails_before_usage_or_execution(acceptance, tmp_path, monkeypatch):

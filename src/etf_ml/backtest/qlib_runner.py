@@ -285,7 +285,9 @@ class ETFRotationStrategy(BaseStrategy):
         self.entitlements = []
         self.record_days = set(self.events.loc[self.events.cash_per_share.gt(0), 'record_date'].dropna()) if 'record_date' in self.events else set()
         self.decisions = []
+        self.risk_checks = []
         self.peak = policy.initial_cash
+        self.initial_equity = policy.initial_cash
         self.previous_value = policy.initial_cash
         self.daily_returns = []
         super().__init__(**kwargs)
@@ -362,19 +364,84 @@ class ETFRotationStrategy(BaseStrategy):
                     'basis': ('post_record_conversions' if row.get('cash_share_basis') == 'post_record_conversions' else 'record_day_close') if explicit else 'pre_action_compatibility'})
             self.applied_events.add(event_id)
 
+    def _record_unchecked_risk(self, date, reason, signal_date=None):
+        row = {"date": str(date.date()), "checked": False, "reason": reason,
+               "risk_mode": self.policy.risk_mode,
+               "decision_valuation_basis": None, "execution_reference_price_basis": None,
+               "decision_execution_timing_status": "not_checked",
+               "drawdown_limit": float(self.policy.max_drawdown_limit) if self.policy.risk_mode == "max_drawdown" else None,
+               "risk_trigger_limit": float(self.policy.risk) if self.policy.risk_mode == "max_drawdown" else None,
+               "risk_order_intents": [], "risk_order_blockers": []}
+        if signal_date is not None:
+            row["signal_date"] = str(signal_date.date())
+        self.risk_checks.append(row)
+
     def generate_trade_decision(self, execute_result=None):
         step = self.trade_calendar.get_trade_step()
         start, end = self.trade_calendar.get_step_time(step)
         date = pd.Timestamp(start).normalize()
         self._actions(date)
-        if date not in self.execution_dates:
-            return TradeDecisionWO([], self)
         location = self.calendar.get_indexer([date])[0]
         if location <= 0:
+            self._record_unchecked_risk(date, "no_prior_session")
             return TradeDecisionWO([], self)
         signal_date = self.calendar[location - 1]
+        # post_exe_step observes the completed bar, including costs and income.
+        # Never use this session's open to decide a same-open risk liquidation.
+        drawdown = 1 - self.previous_value / self.peak
+        volatility = (float(np.std(self.daily_returns[-20:], ddof=1) * np.sqrt(self.annualization_days))
+                      if len(self.daily_returns) >= 20 else None)
+        risk_triggered = (drawdown >= self.policy.risk if self.policy.risk_mode == "max_drawdown"
+                          else volatility is not None and volatility > self.policy.risk)
+        risk_check = {"date": str(date.date()), "signal_date": str(signal_date.date()),
+                      "checked": True, "reason": None, "risk_mode": self.policy.risk_mode,
+                      "planned_rebalance": date in self.execution_dates,
+                      "decision_valuation_basis": "previous_session_close",
+                      "execution_reference_price_basis": "current_session_open",
+                      "decision_execution_timing_status": "prior_close_risk_next_open_execution",
+                      "order_sizing_basis": None,
+                      "equity_at_decision": float(self.previous_value),
+                      "initial_equity": float(self.initial_equity),
+                      "peak_equity_at_decision": float(self.peak), "drawdown": float(drawdown),
+                      "drawdown_limit": float(self.policy.max_drawdown_limit) if self.policy.risk_mode == "max_drawdown" else None,
+                      "risk_trigger_limit": float(self.policy.risk) if self.policy.risk_mode == "max_drawdown" else None,
+                      "annualized_volatility_20d": volatility,
+                      "volatility_limit": float(self.policy.risk) if self.policy.risk_mode == "annualized_volatility" else None,
+                      "risk_triggered": bool(risk_triggered),
+                      "trigger_limit_exceeded": bool(risk_triggered),
+                      "acceptance_limit_exceeded": (bool(drawdown > self.policy.max_drawdown_limit)
+                          if self.policy.risk_mode == "max_drawdown" else None),
+                      "risk_limit_exceeded": (bool(drawdown > self.policy.max_drawdown_limit)
+                          if self.policy.risk_mode == "max_drawdown" else
+                          bool(risk_triggered) if volatility is not None else None),
+                      "generated_order_count": 0, "risk_order_intents": [], "risk_order_blockers": []}
+        self.risk_checks.append(risk_check)
+        if risk_triggered:
+            # Shares, not current-open target weights, define risk orders. Submit
+            # blocked orders too so exchange receipts retain the exact reason.
+            position = self.trade_position
+            scale = 0. if self.policy.risk_mode == "max_drawdown" else self.policy.risk / volatility
+            orders = []
+            for instrument in sorted(position.get_stock_list()):
+                held = position.get_stock_amount(instrument)
+                target = math.floor(held * scale / self.policy.lot_size) * self.policy.lot_size
+                if held > target:
+                    orders.append(Order(stock_id=instrument, amount=held - target,
+                                        start_time=start, end_time=end, direction=Order.SELL))
+            risk_check["order_sizing_basis"] = "held_shares_and_prior_close_risk"
+            risk_check["generated_order_count"] = len(orders)
+            risk_check["risk_order_intents"] = [
+                {"instrument": order.stock_id, "direction": "sell", "requested_shares": float(order.amount),
+                 "order_date": str(date.date()), "signal_date": str(signal_date.date())} for order in orders]
+            self.decisions.append({"date": str(date.date()), "signal_date": str(signal_date.date()),
+                                   "decision_kind": "risk_reduction", "risk_triggered": True,
+                                   "reasons": {"_risk": "risk_limit_triggered"}})
+            return TradeDecisionWO(orders, self)
+        if date not in self.execution_dates:
+            return TradeDecisionWO([], self)
         if signal_date not in self.predictions.index.get_level_values("datetime"):
             self.decisions.append({"date": str(date.date()), "reason": "missing_previous_signal"})
+            risk_check["rebalance_skip_reason"] = "missing_previous_signal"
             return TradeDecisionWO([], self)
         scores = self.predictions.xs(signal_date, level="datetime")
         eligibility = self.universe.xs(signal_date, level="datetime")
@@ -386,9 +453,7 @@ class ETFRotationStrategy(BaseStrategy):
             if row is not None and np.isfinite(row.raw_open) and row.raw_open > 0:
                 position.update_stock_price(instrument, float(row.raw_open))
         equity = position.calculate_value()
-        self.peak = max(self.peak, equity)
-        drawdown = 1 - equity / self.peak
-        risk_triggered = self.policy.risk_mode == "max_drawdown" and drawdown >= self.policy.risk
+        risk_check["order_sizing_basis"] = "current_session_open_target_weight_sizing_unverified"
         candidates = set(scores.index) | set(position.get_stock_list())
         buyable = {i: self.trade_exchange.is_stock_tradable(i, start, end, Order.BUY) for i in candidates}
         sellable = {i: self.trade_exchange.is_stock_tradable(i, start, end, Order.SELL) for i in candidates}
@@ -427,7 +492,10 @@ class ETFRotationStrategy(BaseStrategy):
                                "weights": weights, "cash_weight": max(0, 1 - position.receivable_value() / equity - position.income_book.value() / equity - sum(weights.values())),
                                "receivable_weight": position.receivable_value() / equity,
                                "income_weight": position.income_book.value() / equity,
+                               "risk_triggered": bool(risk_triggered),
                                "reasons": allocation.reasons})
+        risk_check["generated_order_count"] = len(orders)
+        risk_check["allocation_reasons"] = list(allocation.reasons)
         return TradeDecisionWO(orders, self)
 
     def post_exe_step(self, execute_result=None):
@@ -450,6 +518,7 @@ class BacktestResult:
     ledger: pd.DataFrame = field(default_factory=pd.DataFrame)
     entitlements: pd.DataFrame = field(default_factory=pd.DataFrame)
     income_postings: pd.DataFrame = field(default_factory=pd.DataFrame)
+    risk_checks: list[dict] = field(default_factory=list)
 
 
 def evaluate(predictions: pd.Series, policy: PortfolioPolicy, snapshot, *,
@@ -530,4 +599,5 @@ def evaluate(predictions: pd.Series, policy: PortfolioPolicy, snapshot, *,
     metrics['max_return_residual'] = float(ledger.return_residual.abs().max())
     metrics['stale_valuation_dates'] = int(ledger.stale_valuation_instruments.gt(0).sum())
     return BacktestResult(report, trades, positions, returns, metrics, strategy.decisions, exposures, execution, ledger,
-                          pd.DataFrame(strategy.entitlements), pd.DataFrame(exchange.replay.income_book.records))
+                          pd.DataFrame(strategy.entitlements), pd.DataFrame(exchange.replay.income_book.records),
+                          strategy.risk_checks)

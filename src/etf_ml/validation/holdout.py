@@ -47,7 +47,8 @@ def acceptance_reasons(portfolio, cost_stress, config, *, cost_multipliers, stre
         if metrics["execution_cost_over_initial_equity"] > criteria.maximum_execution_cost_over_initial_equity + 1e-12:
             reasons.append(prefix + "execution_cost_threshold")
         risk_key = "max_drawdown" if policy.risk_mode == "max_drawdown" else "annualized_volatility"
-        if metrics[risk_key] > policy.risk + 1e-12: reasons.append(prefix + "portfolio_risk_limit")
+        risk_limit = policy.max_drawdown_limit if policy.risk_mode == "max_drawdown" else policy.risk
+        if metrics[risk_key] > risk_limit + 1e-12: reasons.append(prefix + "portfolio_risk_limit")
         cap = min(policy.k, policy.max_weight) if policy.k_mode == "weight_cap" else policy.max_weight
         if metrics["max_single_weight"] > cap + 1e-8: reasons.append(prefix + "single_weight_limit")
         if metrics["max_group_weight"] > policy.max_group_weight + 1e-8: reasons.append(prefix + "group_weight_limit")
@@ -60,11 +61,29 @@ def acceptance_reasons(portfolio, cost_stress, config, *, cost_multipliers, stre
     return sorted(set(reasons))
 
 
-def run_holdout(config, package_path, output, *, run_id):
+def require_access_review(config, package, access_audit):
+    from etf_ml.research.qualification import holdout_qualification, read_object, evidence
+    manifest_path = Path(package["snapshot_path"]) / "snapshot_manifest.json"
+    manifest = read_object(manifest_path)
+    if manifest.get("snapshot_id") != package["snapshot_id"]:
+        raise IntegrityError("Holdout review snapshot differs from frozen model")
+    result = holdout_qualification(config.validation.model_dump(mode="json"),
+        access_audit=access_audit, snapshot_holdout_start=manifest["spec"]["holdout_start"],
+        snapshot_id=manifest["snapshot_id"], snapshot_end=manifest["cutoff"],
+        snapshot_manifest_sha256=file_hash(manifest_path), require_v2=True)
+    if result["status"] != "eligible":
+        raise ConfigurationError("Independent holdout access review required: " + ",".join(result["reason_codes"]))
+    return evidence(access_audit)
+
+
+def run_holdout(config, package_path, output, *, run_id, access_audit=None, access_audit_sha256=None):
     """Trusted worker: inference and ETF accounting only; never fit a model."""
     bundle, reference, package = load_frozen_model(package_path, config=config)
     if not config.validation.holdout_independent:
         raise ConfigurationError("Independent holdout use has not been confirmed")
+    review = require_access_review(config, package, access_audit)
+    if review["sha256"] != access_audit_sha256:
+        raise IntegrityError("Holdout access review changed before worker execution")
     from etf_ml.models.frozen_features import materialize_frozen_features
     from etf_ml.models import predict
     from etf_ml.data.source import encode_provider
@@ -137,6 +156,7 @@ def run_holdout(config, package_path, output, *, run_id):
               "daily_index_hash": content_hash([str(d) for d in days]),
               "evaluation_index_hash": content_hash([[str(t), i] for t, i in index]),
               "inference_manifest": feature_manifest, "model_fit_performed": False,
+              "access_audit": review,
               "note": "Independent frozen-candidate evaluation; results must never enter agent research feedback"}
     atomic_json(output / "holdout_report.json", result)
     return result
@@ -161,13 +181,14 @@ def _verify_result(result, package, config):
         raise IntegrityError("Independent result changed the frozen evaluation dates or feature parity")
 
 
-def evaluate_holdout(config, package_path, *, run_id):
+def evaluate_holdout(config, package_path, *, run_id, access_audit=None):
     from etf_ml.data.diagnostic import require_formal
     require_formal(config)
     _, _, package = load_frozen_model(package_path, config=config, allow_rejected=True)
     config.acceptance.require_resolved()
     if not config.validation.holdout_independent:
         raise ConfigurationError("Independent holdout use has not been confirmed before freeze")
+    review = require_access_review(config, package, access_audit)
     from etf_ml.data.snapshot import load_snapshot
     snapshot = load_snapshot(package["snapshot_path"])
     if snapshot.manifest["spec"]["holdout_start"] != config.validation.holdout_start:
@@ -180,18 +201,22 @@ def evaluate_holdout(config, package_path, *, run_id):
     usage.history(claim["usage_id"])
     canonical_id = claim["run_id"]
     run_identity = {"usage_id": claim["usage_id"], "identity": identity,
+                    "access_audit": review,
                     "package_manifest_hash": file_hash(Path(package_path) / "manifest.json")}
     with RunStore(config.artifact_root / "final_acceptance" / "runs", canonical_id, run_identity,
                   preserve_completed_on_error=True) as run:
         if run.reused:
             result = json.loads((run.path / "holdout_report.json").read_text(encoding="utf-8"))
             _verify_result(result, package, config)
+            if result.get("access_audit") != review:
+                raise IntegrityError("Cached holdout access review differs")
         else:
             if package["registry_state"] != "frozen":
                 raise QualityError("A decided model cannot start another holdout experiment")
             usage.record(claim["usage_id"], "started", details={"run_id": canonical_id, "identity": identity, "code_hash": code_hash()})
             try:
                 request = {"mode": "holdout", "config": config.model_dump(mode="json"),
+                           "access_audit": review["path"], "access_audit_sha256": review["sha256"],
                            "package_path": str(Path(package_path).resolve()), "output_root": str(run.path), "run_id": canonical_id}
                 atomic_json(run.path / "pipeline_request.json", request)
                 execution = NativeBackend(config.artifact_root).run(
@@ -201,6 +226,8 @@ def evaluate_holdout(config, package_path, *, run_id):
                 if execution.status != "succeeded": _raise_failure(run.path, execution)
                 result = json.loads((run.path / "holdout_report.json").read_text(encoding="utf-8"))
                 _verify_result(result, package, config)
+                if result.get("access_audit") != review:
+                    raise IntegrityError("Worker holdout access review differs")
                 run.complete(result)
             except BaseException as exc:
                 usage.record(claim["usage_id"], "technical_failed", details={"identity": identity,

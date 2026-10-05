@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import pickle
-import time
+import tempfile
 from pathlib import Path
 
 from etf_ml.artifacts import environment_manifest
@@ -21,9 +21,7 @@ def save_bundle(bundle, registry_root: Path) -> Path:
             if existing.manifest != bundle.manifest:
                 raise IntegrityError("Immutable model identity conflict")
             return final
-        temp = ensure_within(root / ("." + bundle.manifest["model_id"] +
-                                    "." + str(time.time_ns()) + ".tmp"), root)
-        temp.mkdir()
+        temp = ensure_within(Path(tempfile.mkdtemp(prefix=".tmp-", dir=root)), root)
         with (temp / "bundle.pkl").open("wb") as stream:
             pickle.dump(bundle, stream, protocol=5)
         atomic_json(temp / "manifest.json", {

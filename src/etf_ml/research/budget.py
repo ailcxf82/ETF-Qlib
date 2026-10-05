@@ -60,7 +60,8 @@ class BudgetLedger:
                     "calls": state["calls"]}
 
     def reserve(self, call_id: str, request_hash: str, *, paid: bool,
-                maximum_cost=None):
+                maximum_cost=None, dispatch_scope: str | None = None,
+                max_dispatches: int | None = None):
         if not RUN_ID.fullmatch(call_id):
             raise ConfigurationError("Invalid external call_id")
         bound = money(maximum_cost) if maximum_cost is not None else None
@@ -80,12 +81,18 @@ class BudgetLedger:
                         call["maximum_cost"] != (str(bound) if bound is not None else None)):
                     raise IntegrityError("External call_id already belongs to another request")
                 return call
+            if dispatch_scope is not None and max_dispatches is not None:
+                used = sum(call.get("dispatch_scope") == dispatch_scope
+                           for call in state["calls"].values())
+                if used >= max_dispatches:
+                    raise BudgetError("Per-trial physical dispatch limit reached")
             measured, outstanding, _ = self._totals(state)
             if self.policy.budget_mode == "capped" and measured + outstanding + (bound or 0) > money(self.policy.api_budget):
                 raise BudgetError("Research monetary cap reached")
             call = {"status": "reserved", "request_hash": request_hash, "paid": paid,
                     "maximum_cost": str(bound) if bound is not None else None,
-                    "actual_cost": None, "response_hash": None, "usage": {}}
+                    "actual_cost": None, "response_hash": None, "usage": {},
+                    "dispatch_scope": dispatch_scope}
             state["calls"][call_id] = call
             atomic_json(self.path, state)
             return call
@@ -114,12 +121,13 @@ class BudgetLedger:
                 raise BudgetError("Actual billed cost exceeded the transport's reserved bound")
             return call
 
-    def uncertain(self, call_id: str, *, reason: str):
+    def uncertain(self, call_id: str, *, reason: str, usage: dict | None = None):
         with FileLock(self.lock_path):
             state = self._read()
             call = state["calls"][call_id]
             if call["status"] == "reserved":
-                call.update({"status": "uncertain", "reason": reason})
+                call.update({"status": "uncertain", "reason": reason,
+                             "usage": dict(usage or call.get("usage", {}))})
                 atomic_json(self.path, state)
 
     def reconcile(self, call_id: str, *, actual_cost, billing_reference: str):

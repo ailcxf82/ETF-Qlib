@@ -27,15 +27,20 @@ def fit(prepared, model_spec: ModelSpec, *, feature_set_id: str,
     if not RUN_ID.fullmatch(run_id):
         raise ConfigurationError("Invalid model run_id")
     # A scoped recorder prevents model logging from leaking to another experiment.
+    history = {}
+    from copy import deepcopy
+    fit_parameters = deepcopy(model_spec.fit)
+    if model_spec.name == "lightgbm":
+        # A fresh sink captures all evaluated rounds, including post-best rounds.
+        fit_parameters["evals_result"] = history
     with scoped_recorder(run_id) as recorder:
-        from copy import deepcopy
-        model.fit(prepared.dataset, **deepcopy(model_spec.fit))
+        model.fit(prepared.dataset, **fit_parameters)
         recorder_id = recorder.id
     learner = getattr(model, "model", None)
     training = {}
     if model_spec.name == "lightgbm":
-        training = {"trained_rounds": learner.current_iteration(),
-                    "best_iteration": learner.best_iteration, "iteration_base": 1}
+        from etf_ml.models.diagnostics import training_metadata
+        training = training_metadata(model, history, fit_parameters)
     elif model_spec.name == "xgboost":
         best = learner.attr("best_iteration")
         training = {"trained_rounds": learner.num_boosted_rounds(),

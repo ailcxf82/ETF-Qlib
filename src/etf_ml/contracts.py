@@ -89,6 +89,8 @@ class PortfolioPolicy(StrictSpec):
     liquidity_mode: Literal["participation"] | None = "participation"
     liquidity_lookback: int = Field(default=20, gt=0)
     risk: float = Field(default=0.12, gt=0, le=1)
+    # Risk trigger can be set earlier than the frozen ex-post drawdown gate.
+    max_drawdown_limit: float = Field(default=0.12, gt=0, le=1)
     risk_mode: Literal["max_drawdown", "annualized_volatility"] | None = "max_drawdown"
     max_weight: float = Field(default=1, gt=0, le=1)
     max_group_weight: float = Field(default=1, gt=0, le=1)
@@ -103,6 +105,8 @@ class PortfolioPolicy(StrictSpec):
             raise ValueError("Count K must be an integer")
         if self.k_mode in ("fraction", "weight_cap") and self.k > 1:
             raise ValueError("Proportion K must be <= 1")
+        if self.risk_mode == "max_drawdown" and self.risk > self.max_drawdown_limit:
+            raise ValueError("Drawdown trigger cannot exceed its acceptance limit")
         return self
 
     def require_resolved(self) -> None:
@@ -125,11 +129,17 @@ class ResearchPolicy(StrictSpec):
     budget_mode: Literal["unlimited", "free_only", "capped"] | None = None
     api_budget: float | None = Field(default=None, ge=0)
     max_trials: int | None = Field(default=1, gt=0)
+    max_dispatches_per_trial: int = Field(default=5, ge=1)
+    max_repairs_per_trial: int = Field(default=2, ge=0)
+    max_campaign_wall_seconds: int = Field(default=28_800, ge=1)
     maximum_lookback: int = Field(default=120, gt=0)
     coverage_threshold: float = Field(default=0.95, gt=0, le=1)
     seeds: list[int] = Field(default_factory=lambda: [42, 43, 44])
     max_drawdown_deterioration: float = Field(default=0, ge=0)
     max_turnover_deterioration: float = Field(default=0, ge=0)
+    # Formal first-loop entry points reject an unresolved value before any
+    # model/provider work.  Legacy protocols retain their original null.
+    stress_min_excess_return: float | None = None
     limits: RuntimeLimits = Field(default_factory=RuntimeLimits)
 
     @model_validator(mode="after")
@@ -180,6 +190,7 @@ class AppConfig(StrictSpec):
     models: list[ModelSpec] = Field(default_factory=lambda: [
         ModelSpec(name="ridge"), ModelSpec(name="lightgbm")])
     artifact_root: Path = Path("artifacts")
+    reuse_root: Path | None = None
 
     @property
     def config_hash(self) -> str:
@@ -209,6 +220,9 @@ class EvaluationResult:
     candidate_id: str | None = None
     by_fold: list[dict[str, Any]] = field(default_factory=list)
     paired_deltas: list[dict[str, Any]] = field(default_factory=list)
+    factor_signal_by_fold: list[dict[str, Any]] = field(default_factory=list)
+    factor_signal_gate: dict[str, Any] = field(default_factory=dict)
+    gate_details: list[dict[str, Any]] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
     artifacts: dict[str, str] = field(default_factory=dict)
 

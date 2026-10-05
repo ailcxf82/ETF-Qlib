@@ -89,9 +89,10 @@ def review_constraints(report, protocol):
     policy = protocol.portfolio
     single = min(policy.max_weight, policy.k) if policy.k_mode == "weight_cap" else policy.max_weight
     risk_key = "max_drawdown" if policy.risk_mode == "max_drawdown" else "annualized_volatility"
+    risk_limit = policy.max_drawdown_limit if policy.risk_mode == "max_drawdown" else policy.risk
     for row in rows.values():
         for scenario, metrics in [("base", row["portfolio"]), *row["cost_stress"].items()]:
-            if metrics[risk_key] > policy.risk + 1e-12:
+            if metrics[risk_key] > risk_limit + 1e-12:
                 violations.append("final_review_risk_limit")
             if metrics["max_single_weight"] > single + 1e-8:
                 violations.append("final_review_single_weight_limit")

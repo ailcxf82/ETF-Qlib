@@ -1,0 +1,17 @@
+# A finite early-stop-only screen; all results remain development evidence.
+seeds: [42]
+num_threads: 2
+num_boost_round: 500
+early_stopping_rounds: 50
+max_fits: 20
+variants:
+  baseline: {}
+  shallow:
+    num_leaves: 7
+    max_depth: 3
+  larger_leaf:
+    min_data_in_leaf: 1000
+  sampled:
+    feature_fraction: 0.8
+    bagging_fraction: 0.8
+    bagging_freq: 1

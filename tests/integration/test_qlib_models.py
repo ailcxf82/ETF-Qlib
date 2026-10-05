@@ -59,6 +59,56 @@ def test_development_handler_rejects_holdout_rows(panel, calendar, fold):
         build(features, labels, events, fold, holdout_start=str(calendar[170].date()))
 
 
+def test_lgbm_diagnostics_capture_discarded_rounds_and_preserve_predictions(panel, calendar, fold):
+    from etf_ml.contracts import FeatureArtifact
+    from etf_ml.models.recorders import scoped_recorder
+    from etf_ml.models.registry import create_model
+
+    frame = panel[["adj_close"]].rename(columns={"adj_close": "signal"})
+    features = FeatureArtifact("lgb-early-stop", frame, {"snapshot_id": "fixture"})
+    labels, events = generate_labels(panel, calendar, LabelSpec())
+    labels = panel.adj_close.rename(labels.name) / 100
+    labels.loc[labels.index.get_level_values("datetime") >= pd.Timestamp(fold.early_stop.start)] *= -1
+    prepared = build(features, labels, events, fold)
+    spec = ModelSpec(constructor={"num_boost_round": 30, "early_stopping_rounds": 3,
+        "min_data_in_leaf": 5, "learning_rate": .5, "num_threads": 1},
+        fit={"verbose_eval": 0, "evals_result": {"old": {"l2": [99.]}}})
+    bundle = fit(prepared, spec, feature_set_id=features.feature_set_id, snapshot_id="fixture")
+    evidence = bundle.manifest["training"]
+    assert evidence["evaluated_rounds"] > evidence["retained_rounds"]
+    assert evidence["evaluated_rounds"] == evidence["best_iteration"] + 3
+    assert evidence["stop_reason"] == "early_stopping"
+    assert evidence["diagnostics"]["status"] == "complete"
+    assert set(evidence["evaluation_history"]) == {"train", "valid"}
+    assert spec.fit["evals_result"] == {"old": {"l2": [99.]}}
+    assert evidence["effective_parameters"]["feature_fraction"] == 1
+    assert evidence["effective_parameters"]["bagging_freq"] == 0
+    # Observe the same model without the new evidence capture: predictions must agree.
+    reference = create_model(spec)
+    with scoped_recorder("plain-lgbm-reference"):
+        reference.fit(prepared.dataset, verbose_eval=0)
+    np.testing.assert_allclose(bundle.model.predict(prepared.dataset), reference.predict(prepared.dataset),
+                               atol=1e-12, rtol=1e-12)
+
+
+def test_lgbm_native_snapshot_resolves_aliases_and_fit_budget(panel, calendar, fold):
+    features = materialize({"snapshot_id": "fixture"}, panel)
+    labels, events = generate_labels(panel, calendar, LabelSpec())
+    prepared = build(features, labels, events, fold)
+    spec = ModelSpec(constructor={"num_boost_round": 20, "early_stopping_rounds": 10,
+        "min_data_in_leaf": 5, "num_threads": 1, "colsample_bytree": .8,
+        "subsample": .75, "subsample_freq": 1},
+        fit={"num_boost_round": 4, "early_stopping_rounds": 8, "verbose_eval": 0})
+    bundle = fit(prepared, spec, feature_set_id=features.feature_set_id, snapshot_id="fixture")
+    evidence = bundle.manifest["training"]
+    assert evidence["effective_parameters"]["feature_fraction"] == .8
+    assert evidence["effective_parameters"]["bagging_fraction"] == .75
+    assert evidence["effective_parameters"]["bagging_freq"] == 1
+    assert evidence["iteration_cap"] == evidence["evaluated_rounds"] == 4
+    assert evidence["early_stopping_rounds"] == 8
+    assert evidence["stop_reason"] == "iteration_cap"
+
+
 def test_xgboost_early_stop_prediction_excludes_later_trees(panel, calendar, fold):
     import xgboost as xgb
     from etf_ml.contracts import FeatureArtifact

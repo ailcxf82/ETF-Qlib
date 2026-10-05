@@ -9,6 +9,7 @@ from etf_ml.research.readiness import first_loop_readiness
 
 def local_config(tmp_path):
     config = AppConfig()
+    config.artifact_root = tmp_path / "artifacts"
     config.data.source = tmp_path / "provider"
     root = config.data.source
     (root / "instruments").mkdir(parents=True)
@@ -33,6 +34,7 @@ def local_config(tmp_path):
     config.portfolio.liquidity_mode = "participation"
     config.portfolio.risk_mode = "max_drawdown"
     config.research.budget_mode = "unlimited"
+    config.research.stress_min_excess_return = 0
     config.research.limits.image = "test@sha256:" + "a" * 64
     config.validation.folds = [{"name": "A", "train": {"start": "2020-01-01", "end": "2021-12-31"},
                                 "early_stop": {"start": "2022-01-01", "end": "2022-12-31"},
@@ -73,6 +75,27 @@ def test_pit_and_events_required(tmp_path):
     assert {"unverified_historical_metadata", "missing_events_path"} <= codes
 
 
+def test_formal_readiness_requires_predeclared_cost_stress_threshold(tmp_path):
+    config = local_config(tmp_path)
+    config.research.stress_min_excess_return = None
+    codes = {row["code"] for row in first_loop_readiness(config)["blockers"]}
+    assert "unresolved_stress_min_excess_return" in codes
+
+
+def test_readiness_validates_campaign_pair_and_reports_finite_cap(tmp_path):
+    config = local_config(tmp_path)
+    result = first_loop_readiness(config, campaign_id="formal-five", campaign_max_trials=5)
+    assert result["campaign"] == {"campaign_id": "formal-five", "max_attempts": 5}
+    assert "campaign_bounds" not in result["not_checked"]
+    assert not (config.artifact_root / "research_campaigns" / "formal-five").exists()
+
+    partial = first_loop_readiness(config, campaign_id="formal-five")
+    assert "incomplete_campaign_bounds" in {row["code"] for row in partial["blockers"]}
+
+    omitted = first_loop_readiness(config)
+    assert "campaign_bounds" in omitted["not_checked"]
+
+
 def test_unsafe_instrument_never_reads_outside_provider(tmp_path):
     config = local_config(tmp_path)
     (config.data.source / "instruments/all.txt").write_text("../secret\t2020-01-01\t2025-01-01\n")
@@ -103,3 +126,47 @@ def test_cli_declared_missing_supplement_blocks_without_training(tmp_path, capsy
     assert {x["code"] for x in result["blockers"]} == {"missing_" + name}
     assert result["external_calls"] == result["training_runs"] == 0
     assert not (config.artifact_root / "runs" / result["run_id"]).exists()
+
+
+def test_exhausted_expired_and_corrupt_campaign_are_not_ready(tmp_path, monkeypatch):
+    from etf_ml.research.campaign import CampaignLedger
+    from etf_ml.utils import source_hashes
+    config = local_config(tmp_path)
+    ledger = CampaignLedger(config.artifact_root / "research_campaigns", "used", 1,
+                            config.research.max_campaign_wall_seconds)
+    ledger.initialize()
+    monkeypatch.setattr("etf_ml.research.campaign.time.time_ns", lambda: 0)
+    assert ledger.begin_trial(run_id="old", trial_index=0, compatibility_group_id="g", protocol_id="p")
+    monkeypatch.setattr("etf_ml.research.campaign.time.time_ns", lambda: 30_000 * 10**9)
+    before = source_hashes(ledger.root)
+    result = first_loop_readiness(config, campaign_id="used", campaign_max_trials=1)
+    assert {"campaign_exhausted", "campaign_expired"} <= {r["code"] for r in result["blockers"]}
+    assert result["campaign_observation"]["campaign_attempted_trials"] == 1
+    assert source_hashes(ledger.root) == before
+    event = next(ledger.events.glob("*.json"))
+    event.write_text("{}", encoding="utf-8")
+    result = first_loop_readiness(config, campaign_id="used", campaign_max_trials=1)
+    assert "invalid_campaign_ledger" in {r["code"] for r in result["blockers"]}
+
+
+def test_existing_campaign_duration_cannot_be_silently_replaced(tmp_path):
+    from etf_ml.research.campaign import CampaignLedger
+    config = local_config(tmp_path)
+    ledger = CampaignLedger(config.artifact_root / "research_campaigns", "old", 5)
+    ledger.initialize()
+    result = first_loop_readiness(config, campaign_id="old", campaign_max_trials=5)
+    assert "campaign_duration_mismatch" in {r["code"] for r in result["blockers"]}
+
+
+def test_runtime_failure_does_not_dispatch_and_w08_remains_deferred(tmp_path, monkeypatch):
+    from etf_ml.errors import DataNotReady
+    config = local_config(tmp_path)
+    def unavailable(*args):
+        raise DataNotReady("offline")
+    monkeypatch.setattr("etf_ml.runtime.docker.DockerBackend.preflight", unavailable)
+    result = first_loop_readiness(config, check_runtime=True)
+    assert result["runtime"]["status"] == "blocked"
+    assert result["external_calls"] == result["training_runs"] == 0
+    assert result["deferred_stages"][0]["blocks_research_preparation"] is False
+    assert result["deferred_stages"][0]["status"] == "not_run"
+    assert result["investment_ready"] is False

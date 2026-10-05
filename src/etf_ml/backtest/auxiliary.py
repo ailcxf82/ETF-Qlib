@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -9,7 +10,7 @@ from etf_ml.backtest.results import evaluate_with_stress
 from etf_ml.data.calendar import require_calendar
 from etf_ml.data.source import require_panel
 from etf_ml.errors import QualityError
-from etf_ml.utils import atomic_json, code_hash, content_hash
+from etf_ml.utils import FileLock, atomic_json, code_hash, content_hash
 
 
 def momentum_scores(panel, calendar, lookback=20):
@@ -54,13 +55,15 @@ def signal_coverage(scores, eligibility):
 
 
 def run_auxiliary(config, panel, research_calendar, decision_universe, *, fold, snapshot_id, protocol_id,
-                  labels, evaluation_index, output, cost_multipliers=(2.0,), **kwargs):
-    rule_scores = {
-        "manual_momentum": momentum_scores(panel, research_calendar, config.benchmarks.momentum_lookback),
-        "equal_weight_pool": pd.Series(1., index=panel.index, name="score"),
+                  labels, evaluation_index, output, cost_multipliers=(2.0,),
+                  cache_root=None, progress=None, progress_fields=None, **kwargs):
+    score_factories = {
+        "manual_momentum": lambda: momentum_scores(
+            panel, research_calendar, config.benchmarks.momentum_lookback),
+        "equal_weight_pool": lambda: pd.Series(1., index=panel.index, name="score"),
     }
     rows = []
-    for name, scores in rule_scores.items():
+    for name, build_scores in score_factories.items():
         policy = equal_pool_policy(config.portfolio) if name == "equal_weight_pool" else config.portfolio
         identity = {"schema_version": 1, "strategy": name, "snapshot_id": snapshot_id,
                     "protocol_id": protocol_id, "fold": fold.model_dump(mode="json"),
@@ -70,27 +73,61 @@ def run_auxiliary(config, panel, research_calendar, decision_universe, *, fold, 
                     "universe_policy": config.universe.model_dump(mode="json"),
                     "validation": config.validation.model_dump(mode="json"),
                     "cost_multipliers": list(cost_multipliers), "code_hash": code_hash(),
+                    "evaluation_index_hash": content_hash([[str(t), i] for t, i in evaluation_index]),
                     "selection_rule": "all_buyable_pool_equal_weight" if name == "equal_weight_pool" else "configured_k_policy"}
         baseline_id = content_hash(identity)
-        scores.attrs.update({"baseline_id": baseline_id, "snapshot_id": snapshot_id,
-                             "score_type": "deterministic_rule", "learned": False})
-        path = Path(output) / name
-        path.mkdir(parents=True, exist_ok=True)
-        scores.to_frame().to_parquet(path / "predictions.parquet")
-        atomic_json(path / "rule_manifest.json", {**identity, "baseline_id": baseline_id})
-        result, stress = evaluate_with_stress(scores, policy, panel, output=path,
-                                              cost_multipliers=cost_multipliers, **kwargs)
-        if not result.daily_returns.index.equals(kwargs["calendar"][
-                (kwargs["calendar"] >= kwargs["start_time"]) & (kwargs["calendar"] <= kwargs["end_time"])]):
-            raise QualityError("Auxiliary backtest changed the common evaluation dates")
-        row = {"fold": fold.name, "strategy": name, "baseline_id": baseline_id,
-               "learned": False, "portfolio": result.metrics, "cost_stress": stress,
-               "execution_policy": policy.model_dump(mode="json"),
-               "daily_index_hash": content_hash([str(t) for t in result.daily_returns.index]),
-               "evaluation_index_hash": content_hash([[str(t), i] for t, i in evaluation_index]),
-               "predictive": predictive_metrics(scores.loc[evaluation_index], labels.loc[evaluation_index]),
-               "signal_coverage": signal_coverage(scores, decision_universe.eligible),
-               "artifact_path": str(path)}
-        atomic_json(path / "metrics.json", row)
-        rows.append(row)
+        root = Path(cache_root) / baseline_id if cache_root else Path(output) / name
+        lock = FileLock(Path(cache_root) / ".locks" / (baseline_id + ".lock")) if cache_root else nullcontext()
+        if progress:
+            progress.emit("auxiliary_strategy_started", fold=fold.name, strategy=name,
+                          baseline_id=baseline_id, cached=bool(cache_root),
+                          **(progress_fields or {}))
+        with lock:
+            manifest_path, metrics_path = root / "rule_manifest.json", root / "metrics.json"
+            required_results = [root / "daily_returns.parquet", *[
+                root / ("cost-" + str(multiplier)) / "daily_returns.parquet"
+                for multiplier in cost_multipliers
+            ]]
+            if manifest_path.is_file() and metrics_path.is_file() and all(path.is_file() for path in required_results):
+                import json
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if manifest == {**identity, "baseline_id": baseline_id}:
+                    rows.append(json.loads(metrics_path.read_text(encoding="utf-8")))
+                    if progress:
+                        progress.emit("auxiliary_strategy_completed", fold=fold.name, strategy=name,
+                                      baseline_id=baseline_id, cache_reused=True,
+                                      **(progress_fields or {}))
+                    continue
+            scores = build_scores()
+            scores.attrs.update({"baseline_id": baseline_id, "snapshot_id": snapshot_id,
+                                 "score_type": "deterministic_rule", "learned": False})
+            root.mkdir(parents=True, exist_ok=True)
+            scores.to_frame().to_parquet(root / "predictions.parquet")
+            atomic_json(manifest_path, {**identity, "baseline_id": baseline_id})
+            def report_backtest_phase(phase, **details):
+                if progress:
+                    progress.emit("auxiliary_backtest_" + phase, fold=fold.name,
+                                  strategy=name, baseline_id=baseline_id,
+                                  **(progress_fields or {}), **details)
+
+            result, stress = evaluate_with_stress(
+                scores, policy, panel, output=root, cost_multipliers=cost_multipliers,
+                phase_callback=report_backtest_phase, **kwargs)
+            if not result.daily_returns.index.equals(kwargs["calendar"][
+                    (kwargs["calendar"] >= kwargs["start_time"]) & (kwargs["calendar"] <= kwargs["end_time"])]):
+                raise QualityError("Auxiliary backtest changed the common evaluation dates")
+            row = {"fold": fold.name, "strategy": name, "baseline_id": baseline_id,
+                   "learned": False, "portfolio": result.metrics, "cost_stress": stress,
+                   "execution_policy": policy.model_dump(mode="json"),
+                   "daily_index_hash": content_hash([str(t) for t in result.daily_returns.index]),
+                   "evaluation_index_hash": identity["evaluation_index_hash"],
+                   "predictive": predictive_metrics(scores.loc[evaluation_index], labels.loc[evaluation_index]),
+                   "signal_coverage": signal_coverage(scores, decision_universe.eligible),
+                   "artifact_path": str(root)}
+            atomic_json(metrics_path, row)
+            rows.append(row)
+            if progress:
+                progress.emit("auxiliary_strategy_completed", fold=fold.name, strategy=name,
+                              baseline_id=baseline_id, cache_reused=False,
+                              **(progress_fields or {}))
     return rows

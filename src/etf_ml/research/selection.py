@@ -6,7 +6,9 @@ from dataclasses import asdict
 from pathlib import Path
 
 from etf_ml.contracts import EvaluationResult
+from etf_ml.backtest.metrics import positive_icir_gate, summarize_icir_gates
 from etf_ml.research.protocol import ComparisonProtocol
+from etf_ml.research.statistics import moving_block_mean_uncertainty
 from etf_ml.utils import atomic_json
 
 REQUIRED_METRICS = ("excess_return", "max_drawdown", "turnover", "annualized_volatility")
@@ -62,11 +64,15 @@ def _validate_report(report: dict, protocol: ComparisonProtocol) -> dict:
 
 
 def compare(baseline: dict, candidate: dict, protocol: ComparisonProtocol, *,
-            run_id: str, ablation: dict | None = None, output: Path | None = None) -> EvaluationResult:
+            run_id: str, ablation: dict | None = None,
+            factor_signal_by_fold: list[dict] | None = None,
+            output: Path | None = None) -> EvaluationResult:
     """Deterministic gates; LLM commentary cannot override this decision.
 
     Seeds are summarized inside each fold. They are not counted as additional
     independent time periods when computing the majority-fold condition.
+    Directional factor IC and ICIR must both be positive in a strict majority
+    of folds (at least three of the five production development folds).
     """
     protocol.portfolio.require_resolved()
     result = EvaluationResult(status="failed", stage="factor_selection", run_id=run_id,
@@ -83,7 +89,71 @@ def compare(baseline: dict, candidate: dict, protocol: ComparisonProtocol, *,
         removed = _validate_report(ablation, protocol) if ablation is not None else None
         if removed is not None and ablation.get("feature_set_id") != protocol.baseline_feature_set_id:
             raise ValueError("ablation_feature_identity_mismatch")
+        result.factor_signal_gate = summarize_icir_gates(
+            [{"status": "unknown"} for _ in protocol.validation.folds])
+        if factor_signal_by_fold is not None:
+            signal_rows = {row.get("fold"): row for row in factor_signal_by_fold
+                           if isinstance(row, dict)}
+            expected_folds = {fold.name for fold in protocol.validation.folds}
+            if len(signal_rows) != len(factor_signal_by_fold) or set(signal_rows) != expected_folds:
+                raise ValueError("factor_icir_fold_matrix_mismatch")
+            for fold in protocol.validation.folds:
+                row = signal_rows[fold.name]
+                oriented = row.get("oriented_validation")
+                if not isinstance(oriented, dict):
+                    raise ValueError("factor_icir_metrics_missing")
+                ic, icir = oriented.get("ic"), oriented.get("icir")
+                orientation = row.get("training_orientation") or {}
+                if not isinstance(orientation, dict):
+                    raise ValueError("factor_training_orientation_invalid")
+                direction = orientation.get("direction", "unknown")
+                status = (positive_icir_gate(oriented)["status"]
+                          if direction in {"positive", "reverse"} else "unknown")
+                daily = [item for item in oriented.get("by_date", [])
+                         if item.get("valid") is True and item.get("ic") is not None
+                         and item.get("rank_ic") is not None]
+                seed = protocol.bootstrap_seed + len(result.factor_signal_by_fold)
+                if daily:
+                    ic_uncertainty = moving_block_mean_uncertainty(
+                        [item["ic"] for item in daily], block_length=protocol.time_block_length,
+                        repetitions=protocol.bootstrap_repetitions, seed=seed)
+                    rank_ic_uncertainty = moving_block_mean_uncertainty(
+                        [item["rank_ic"] for item in daily], block_length=protocol.time_block_length,
+                        repetitions=protocol.bootstrap_repetitions, seed=seed)
+                    effective_observations = sum(item.get("cross_section", 0) for item in daily)
+                    eligible_observations = sum(item.get("eligible_cross_section", 0) for item in daily)
+                else:
+                    ic_uncertainty = rank_ic_uncertainty = {
+                        "status": "inconclusive", "reason": "daily_signal_series_missing",
+                        "mean_confidence_interval": None,
+                        "information_ratio_confidence_interval": None}
+                    effective_observations = eligible_observations = 0
+                result.factor_signal_by_fold.append({
+                    "fold": fold.name, "ic": ic, "icir": icir,
+                    "rank_ic": oriented.get("rank_ic"), "rank_icir": oriented.get("rank_icir"),
+                    "effective_dates": oriented.get("effective_dates"),
+                    "total_dates": oriented.get("total_dates"),
+                    "effective_observations": effective_observations,
+                    "eligible_observations": eligible_observations,
+                    "coverage": oriented.get("coverage"),
+                    "ic_uncertainty": ic_uncertainty,
+                    "rank_ic_uncertainty": rank_ic_uncertainty,
+                    "status": status, "training_orientation": direction})
+            result.factor_signal_gate = summarize_icir_gates(result.factor_signal_by_fold)
         violations = []
+        def record_gate(reason, metric, value, threshold, *, fold=None, seed=None,
+                        cost_multiplier=None, minimum=False, tolerance=1e-12):
+            margin = threshold - value if minimum else value - threshold
+            failed = value < threshold - tolerance if minimum else value > threshold + tolerance
+            result.gate_details.append({"reason": reason, "metric": metric,
+                "fold": fold, "seed": seed, "cost_multiplier": cost_multiplier,
+                "value": value, "threshold": threshold,
+                "constraint": "minimum" if minimum else "maximum",
+                "tolerance": tolerance, "exceedance": max(0., margin),
+                "status": "failed" if failed else "passed"})
+            if failed:
+                violations.append(reason)
+
         for key in sorted(left):
             b, c = left[key], right[key]
             if b["daily_index_hash"] != c["daily_index_hash"]:
@@ -100,34 +170,42 @@ def compare(baseline: dict, candidate: dict, protocol: ComparisonProtocol, *,
             result.by_fold.append({"fold": key[0], "seed": key[1],
                                    "baseline": b["portfolio"], "candidate": c["portfolio"],
                                    "candidate_cost_stress": c["cost_stress"]})
-            if delta["max_drawdown"] > protocol.research.max_drawdown_deterioration + 1e-12:
-                violations.append("drawdown_deterioration")
-            if delta["turnover"] > protocol.research.max_turnover_deterioration + 1e-12:
-                violations.append("turnover_deterioration")
+            record_gate("drawdown_deterioration", "max_drawdown_delta", delta["max_drawdown"],
+                        protocol.research.max_drawdown_deterioration, fold=key[0], seed=key[1])
+            record_gate("turnover_deterioration", "turnover_delta", delta["turnover"],
+                        protocol.research.max_turnover_deterioration, fold=key[0], seed=key[1])
             risk_key = "max_drawdown" if protocol.portfolio.risk_mode == "max_drawdown" else "annualized_volatility"
-            if c["portfolio"][risk_key] > protocol.portfolio.risk + 1e-12:
-                violations.append("absolute_risk_limit")
+            risk_limit = (protocol.portfolio.max_drawdown_limit
+                          if protocol.portfolio.risk_mode == "max_drawdown" else protocol.portfolio.risk)
+            record_gate("absolute_risk_limit", risk_key, c["portfolio"][risk_key],
+                        risk_limit, fold=key[0], seed=key[1])
             single_cap = (min(protocol.portfolio.max_weight, protocol.portfolio.k)
                           if protocol.portfolio.k_mode == "weight_cap" else protocol.portfolio.max_weight)
-            for prefix, metrics in [("", c["portfolio"]), *[
-                    ("cost_pressure_", s) for s in c["cost_stress"].values()]]:
-                if metrics["max_single_weight"] > single_cap + 1e-8:
-                    violations.append(prefix + "single_weight_limit")
-                if metrics["max_group_weight"] > protocol.portfolio.max_group_weight + 1e-8:
-                    violations.append(prefix + "group_weight_limit")
-                if metrics["max_unclassified_weight"] > 1e-12:
-                    violations.append(prefix + "unclassified_holding_exposure")
-            for stress in c["cost_stress"].values():
-                if stress[risk_key] > protocol.portfolio.risk + 1e-12:
-                    violations.append("cost_pressure_risk_limit")
-                if protocol.stress_min_excess_return is not None and stress["excess_return"] < protocol.stress_min_excess_return:
-                    violations.append("cost_pressure_return_limit")
+            for multiplier, metrics in [(None, c["portfolio"]), *c["cost_stress"].items()]:
+                prefix = "" if multiplier is None else "cost_pressure_"
+                for reason, metric, limit, tolerance in [
+                        ("single_weight_limit", "max_single_weight", single_cap, 1e-8),
+                        ("group_weight_limit", "max_group_weight", protocol.portfolio.max_group_weight, 1e-8),
+                        ("unclassified_holding_exposure", "max_unclassified_weight", 0., 1e-12)]:
+                    record_gate(prefix + reason, metric, metrics[metric], limit, fold=key[0], seed=key[1],
+                                cost_multiplier=multiplier, tolerance=tolerance)
+            for multiplier, stress in c["cost_stress"].items():
+                record_gate("cost_pressure_risk_limit", risk_key, stress[risk_key], risk_limit,
+                            fold=key[0], seed=key[1], cost_multiplier=multiplier)
+                if protocol.stress_min_excess_return is not None:
+                    record_gate("cost_pressure_return_limit", "excess_return", stress["excess_return"],
+                                protocol.stress_min_excess_return, fold=key[0], seed=key[1],
+                                cost_multiplier=multiplier, minimum=True, tolerance=0.)
         fold_deltas = [statistics.median(d["excess_return"] for d in result.paired_deltas
                                         if d["fold"] == f.name) for f in protocol.validation.folds]
         if statistics.median(fold_deltas) <= 0 or sum(v > 0 for v in fold_deltas) <= len(fold_deltas) / 2:
             violations.append("no_majority_fold_increment")
         for seed in protocol.research.seeds:
-            if statistics.median(d["excess_return"] for d in result.paired_deltas if d["seed"] == seed) <= 0:
+            median = statistics.median(d["excess_return"] for d in result.paired_deltas if d["seed"] == seed)
+            result.gate_details.append({"reason": "seed_instability", "metric": "median_excess_return_delta",
+                "seed": seed, "fold": None, "value": median, "threshold": 0.,
+                "constraint": "strictly_positive", "status": "passed" if median > 0 else "failed"})
+            if median <= 0:
                 violations.append("seed_instability")
         if removed is not None:
             ablation_deltas = [statistics.median(
@@ -136,14 +214,18 @@ def compare(baseline: dict, candidate: dict, protocol: ComparisonProtocol, *,
                 for s in protocol.research.seeds) for f in protocol.validation.folds]
             if statistics.median(ablation_deltas) <= 0 or sum(v > 0 for v in ablation_deltas) <= len(ablation_deltas) / 2:
                 violations.append("ablation_not_confirmed")
+        if result.factor_signal_gate["status"] == "failed":
+            violations.append("factor_icir_insufficient_passing_folds")
         if violations:
             result.status, result.reasons = "rejected", sorted(set(violations))
-        elif ablation is None or protocol.stress_min_excess_return is None:
+        elif ablation is None or protocol.stress_min_excess_return is None or result.factor_signal_gate["status"] != "passed":
             result.status = "inconclusive"
             result.reasons = ([ "ablation_evidence_missing" ] if ablation is None else []) + (
-                ["cost_pressure_threshold_unresolved"] if protocol.stress_min_excess_return is None else [])
+                ["cost_pressure_threshold_unresolved"] if protocol.stress_min_excess_return is None else []) + (
+                ["factor_icir_evidence_missing" if factor_signal_by_fold is None else "factor_icir_evidence_inconclusive"]
+                if result.factor_signal_gate["status"] != "passed" else [])
         else:
-            result.status, result.reasons = "accepted", ["all_frozen_gates_passed"]
+            result.status, result.reasons = "accepted", ["all_frozen_portfolio_and_factor_signal_gates_passed"]
     except (ValueError, KeyError, TypeError, statistics.StatisticsError) as exc:
         result.status = "failed"
         result.reasons = [str(exc)]

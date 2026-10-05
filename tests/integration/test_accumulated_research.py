@@ -98,6 +98,9 @@ def test_accumulated_session_worker_trains_all_features_and_removes_entire_group
             assert row["cost_stress"]["2.0"]["accounting_reconciled"]
     manifests = {p: p.stat().st_mtime_ns
                  for p in (session.root / "paired" / "experiments").glob("*/manifest.json")}
-    assert len(manifests) == 8
+    # Single-factor ablation reuses the verified baseline; group ablation remains distinct.
+    assert len(manifests) == 6
+    assert reports["ablation"]["reused_from"] == "baseline"
+    assert "reused_from" not in reports["group_ablation"]
     assert execute_research(restored, second, run_id="accumulated-pair") == result
     assert manifests == {p: p.stat().st_mtime_ns for p in manifests}

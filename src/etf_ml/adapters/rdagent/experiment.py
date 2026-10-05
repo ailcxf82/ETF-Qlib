@@ -95,15 +95,19 @@ class ETFWorkspace(FBWorkspace):
             return self.running_info.result
         task = self.target_task
         payload = task.proposal.model_dump(mode="json")
-        payload.update({"source": self.file_dict.get("factor.py", ""),
-                        "context_hash": self.context.context_hash})
+        if task.proposal.trusted_implementation is None:
+            payload["source"] = self.file_dict.get("factor.py", "")
+        payload["context_hash"] = self.context.context_hash
         task.spec = FactorSpec.model_validate(payload)
         task.spec.validate_context(self.context)
         atomic_json(self.workspace_path / "factor_spec.json", task.spec)
-        (self.workspace_path / "factor.py").write_text(task.spec.source, encoding="utf-8")
+        if task.spec.trusted_implementation is None:
+            (self.workspace_path / "factor.py").write_text(task.spec.source, encoding="utf-8")
         current = self.session.registry.register(task.spec, lineage={
             "snapshot_id": self.session.snapshot.snapshot_id,
-            "protocol_id": self.session.protocol.protocol_id, "context_hash": self.context.context_hash})
+            "protocol_id": self.session.protocol.protocol_id, "context_hash": self.context.context_hash,
+            **({"trusted_implementation": task.spec.trusted_implementation}
+               if task.spec.trusted_implementation is not None else {})})
         if (current["state"] == "retired" or (current["state"] == "rejected" and
                 not any(e["state"] == "validated" for e in current["events"]))):
             raise QualityError("Factor version already " + current["state"])

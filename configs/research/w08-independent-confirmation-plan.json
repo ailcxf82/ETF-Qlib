@@ -1,0 +1,51 @@
+{
+  "schema_version": "independent-confirmation-plan-v1",
+  "status": "prepared_validation_deferred",
+  "prepared_on": "2026-09-26",
+  "request_basis": "用户要求补充W08，缺乏实际数据时考虑跳过，未定参数参考通常数值；不放松研究门槛。",
+  "defaults_basis": "agent_selected_provisional_engineering_thresholds_not_industry_averages",
+  "configuration": "configs/data/tushare_formal_w08_preparation.yaml",
+  "historical_window": {
+    "snapshot_id": "8b384b5d9f8fa10d3d7b6aebbf11fd9463dc76cc9fe203d38dfc6f5ad4322831",
+    "start": "2026-01-01",
+    "end": "2026-09-04",
+    "market_data_exists": true,
+    "access_history": "unknown",
+    "independence_proven": false,
+    "decision": "defer_independent_evaluation_do_not_certify_history"
+  },
+  "missing_evidence_policy": {
+    "allow_research_preparation": true,
+    "allow_independent_evaluation": false,
+    "treat_skipped_as_passed": false,
+    "fabricate_access_attestation": false,
+    "replace_real_results_with_defaults": false,
+    "relax_research_gates": false,
+    "holdout_evaluation": "not_run",
+    "prospective_oos": "not_started",
+    "investment_ready": false
+  },
+  "future_confirmation": {
+    "status": "not_registered",
+    "candidate_version_id": null,
+    "snapshot_id": null,
+    "start": null,
+    "end": null,
+    "start_rule": "First eligible trading session after accepted candidate freeze and completed preregistration; no retroactive start.",
+    "minimum_effective_dates": 252,
+    "minimum_calendar_months": 12,
+    "end_rule": "Before launch, fix the first exchange-calendar session satisfying both 252 scheduled sessions and 12 calendar months; never extend after viewing results to chase a pass.",
+    "missing_data_rule": "At the frozen end, insufficient valid dates means inconclusive, not passed; no zero-fill or retrospective date deletion.",
+    "one_time_result_review": true,
+    "operational_risk_checks_allowed": true,
+    "candidate_or_threshold_change_requires_new_observation": true,
+    "requires_new_snapshot_protocol_and_matched_baseline": true,
+    "requires_reviewed_access_audit_v2": true,
+    "execution_implemented_by_this_plan": false
+  },
+  "sources": [
+    {"url": "https://www.cfainstitute.org/insights/professional-learning/refresher-readings/2026/backtesting-and-simulation", "supports": "Walk-forward and stress-test methodology and bias caveats, not numerical pass thresholds."},
+    {"url": "https://www.gipsstandards.org/standards/gips-standards-for-firms/gips-standards-handbook-for-firms/", "supports": "Do not annualize sub-year returns; 36 monthly observations for specified three-year ex-post standard deviation reporting. Does not prescribe 252 days as proof of factor effectiveness."},
+    {"url": "https://www.sec.gov/Archives/edgar/data/1444822/000119312526198088/d42635d497k.htm", "supports": "AQR Style Premia Alternative Fund targets 10% volatility with expected forecast target range 8%-15%. One global long-short fund, not the average of Chinese ETF strategies or a realized volatility guarantee."}
+  ]
+}

@@ -13,6 +13,10 @@ from typing import Any
 from etf_ml.errors import ConfigurationError, IntegrityError
 
 SENSITIVE_KEYS = ("api_key", "credential", "password", "secret", "token", "authorization")
+SAFE_USAGE_KEYS = {"input_tokens", "output_tokens", "prompt_tokens", "completion_tokens",
+                   "cached_tokens", "cache_read_input_tokens", "reasoning_tokens",
+                   "estimated_input_tokens", "estimated_output_tokens",
+                   "provider_input_tokens", "provider_output_tokens", "tokenizer_version"}
 
 
 def json_default(value: Any) -> Any:
@@ -60,7 +64,8 @@ def source_hashes(root: Path) -> dict[str, str]:
 
 def redact(value: Any) -> Any:
     if isinstance(value, dict):
-        return {str(k): "[REDACTED]" if any(s in str(k).lower() for s in SENSITIVE_KEYS)
+        return {str(k): "[REDACTED]" if (str(k).lower() not in SAFE_USAGE_KEYS and
+                                           any(s in str(k).lower() for s in SENSITIVE_KEYS))
                 else redact(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [redact(v) for v in value]

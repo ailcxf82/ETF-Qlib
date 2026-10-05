@@ -1,9 +1,12 @@
 import copy
+import numpy as np
+import pandas as pd
 
 import pytest
 
 from etf_ml.contracts import (LabelSpec, ModelSpec, PortfolioPolicy, ResearchPolicy,
                              UniversePolicy, ValidationSpec, FoldSpec)
+from etf_ml.errors import ConfigurationError
 from etf_ml.research.protocol import ComparisonProtocol
 from etf_ml.research.selection import compare
 
@@ -46,15 +49,206 @@ def report(protocol, *, candidate=False, gain=.01):
             "baseline_feature_set_id": "base" if candidate else None, "by_fold": rows}
 
 
+def factor_signal(protocol, *, failing_fold=None):
+    return [{"fold": fold.name, "training_orientation": {"direction": "positive"},
+             "oriented_validation": {"ic": -.01 if fold.name == failing_fold else .01,
+                                     "icir": .2, "icir_status": "available"}}
+            for fold in protocol.validation.folds]
+
+
 def test_accept_requires_full_matrix_stress_and_ablation(protocol):
     baseline, candidate = report(protocol), report(protocol, candidate=True)
-    decision = compare(baseline, candidate, protocol, run_id="one", ablation=report(protocol))
+    decision = compare(baseline, candidate, protocol, run_id="one", ablation=report(protocol),
+                       factor_signal_by_fold=factor_signal(protocol))
     assert decision.status == "accepted" and len(decision.paired_deltas) == 9
+    assert decision.gate_details and all(row["status"] == "passed" for row in decision.gate_details)
     assert compare(baseline, candidate, protocol, run_id="two").status == "inconclusive"
     unresolved = protocol.model_copy(update={"stress_min_excess_return": None})
     baseline, candidate = report(unresolved), report(unresolved, candidate=True)
     assert compare(baseline, candidate, unresolved, run_id="three",
                    ablation=report(unresolved)).status == "inconclusive"
+
+
+def test_factor_icir_is_a_fold_level_formal_gate_without_cross_fold_averaging(protocol):
+    baseline, candidate = report(protocol), report(protocol, candidate=True)
+    decision = compare(baseline, candidate, protocol, run_id="ic-fold-gate",
+        ablation=report(protocol), factor_signal_by_fold=factor_signal(protocol, failing_fold="B"))
+    assert decision.status == "accepted"
+    assert decision.factor_signal_gate["passing_folds"] == 2
+    assert decision.factor_signal_gate["required_pass_folds"] == 2
+    assert [(row["fold"], row["status"]) for row in decision.factor_signal_by_fold] == [
+        ("A", "passed"), ("B", "failed"), ("C", "passed")]
+
+
+def test_factor_icir_requires_complete_unique_fold_matrix(protocol):
+    baseline, candidate = report(protocol), report(protocol, candidate=True)
+    decision = compare(baseline, candidate, protocol, run_id="ic-missing-fold",
+        ablation=report(protocol), factor_signal_by_fold=factor_signal(protocol)[:-1])
+    assert decision.status == "failed"
+    assert decision.reasons == ["factor_icir_fold_matrix_mismatch"]
+
+
+def test_formal_signal_report_preserves_rank_ic_sample_sizes_and_block_intervals(protocol):
+    baseline, candidate = report(protocol), report(protocol, candidate=True)
+    signals = factor_signal(protocol)
+    daily = [{"valid": True, "ic": float(np.sin(i / 7) * .02),
+              "rank_ic": float(np.cos(i / 9) * .03),
+              "cross_section": 25, "eligible_cross_section": 25}
+             for i in range(120)]
+    for row in signals:
+        row["oriented_validation"].update({
+            "rank_ic": .02, "rank_icir": .3, "effective_dates": 120,
+            "total_dates": 120, "coverage": 1., "by_date": daily})
+    decision = compare(baseline, candidate, protocol, run_id="signal-report",
+                       ablation=report(protocol), factor_signal_by_fold=signals)
+    row = decision.factor_signal_by_fold[0]
+    assert row["rank_ic"] == pytest.approx(.02)
+    assert row["rank_icir"] == pytest.approx(.3)
+    assert row["effective_dates"] == 120
+    assert row["effective_observations"] == 3000
+    assert row["eligible_observations"] == 3000 and row["coverage"] == 1.
+    assert row["ic_uncertainty"]["status"] == "completed"
+    assert row["rank_ic_uncertainty"]["status"] == "completed"
+    assert len(row["ic_uncertainty"]["mean_confidence_interval"]) == 2
+
+
+def test_gate_details_identify_exact_pair_stress_and_seed_without_relaxing_gates(protocol):
+    baseline, candidate = report(protocol), report(protocol, candidate=True)
+    candidate["by_fold"][0]["portfolio"]["max_drawdown"] = .2
+    candidate["by_fold"][0]["cost_stress"]["2.0"]["excess_return"] = -.04
+    for row in candidate["by_fold"]:
+        if row["seed"] == 43:
+            row["portfolio"]["excess_return"] = -.01
+    result = compare(baseline, candidate, protocol, run_id="details",
+                     ablation=baseline, factor_signal_by_fold=factor_signal(protocol))
+    failed = [row for row in result.gate_details if row["status"] == "failed"]
+    risk = next(row for row in failed if row["reason"] == "absolute_risk_limit")
+    assert (risk["fold"], risk["seed"], risk["cost_multiplier"]) == ("A", 42, None)
+    assert risk["exceedance"] == pytest.approx(.08)
+    stress = next(row for row in failed if row["reason"] == "cost_pressure_return_limit")
+    assert stress["cost_multiplier"] == "2.0" and stress["exceedance"] == .04
+    assert any(row["reason"] == "seed_instability" and row["seed"] == 43 for row in failed)
+    assert result.status == "rejected"
+    assert {row["reason"] for row in failed}.issubset(result.reasons)
+
+
+@pytest.mark.parametrize("metrics,expected_status", [
+    ({"ic": 0., "icir": .2, "icir_status": "available"}, "unknown"),
+    ({"ic": .2, "icir": None, "icir_status": "insufficient_dates"}, "unknown"),
+])
+def test_factor_icir_zero_and_unavailable_never_pass(protocol, metrics, expected_status):
+    baseline, candidate = report(protocol), report(protocol, candidate=True)
+    signals = factor_signal(protocol, failing_fold="C")
+    signals[0]["oriented_validation"] = metrics
+    decision = compare(baseline, candidate, protocol, run_id="ic-strict-positive",
+                       ablation=report(protocol), factor_signal_by_fold=signals)
+    assert decision.status == "inconclusive"
+    assert decision.factor_signal_by_fold[0]["status"] == expected_status
+
+
+@pytest.fixture
+def five_fold_protocol(protocol):
+    payload = protocol.model_dump(mode="json")
+    payload["validation"]["folds"].extend([
+        {**payload["validation"]["folds"][0], "name": name} for name in ["D", "E"]])
+    return ComparisonProtocol.model_validate(payload)
+
+
+@pytest.mark.parametrize("passing", [0, 1, 2, 3, 4, 5])
+def test_three_of_five_oriented_folds_qualify_without_averaging(five_fold_protocol, passing):
+    protocol = five_fold_protocol
+    signals = factor_signal(protocol)
+    signals[0]["training_orientation"]["direction"] = "reverse"
+    for row in signals[passing:]:
+        row["oriented_validation"].update(ic=-.9, icir=-9.)
+    decision = compare(report(protocol), report(protocol, candidate=True), protocol,
+        run_id="three-of-five", ablation=report(protocol), factor_signal_by_fold=signals)
+    assert decision.status == ("accepted" if passing >= 3 else "rejected")
+    assert decision.factor_signal_gate == {
+        "rule": "strict_majority", "status": "passed" if passing >= 3 else "failed",
+        "fold_count": 5, "required_pass_folds": 3, "passing_folds": passing,
+        "failed_folds": 5 - passing, "unknown_folds": 0}
+
+
+def test_missing_signal_evidence_cannot_qualify(five_fold_protocol):
+    p = five_fold_protocol
+    result = compare(report(p), report(p, candidate=True), p, run_id="no-signals", ablation=report(p))
+    assert result.status == "inconclusive"
+    assert "factor_icir_evidence_missing" in result.reasons
+    assert result.factor_signal_gate["required_pass_folds"] == 3
+
+
+def test_three_signal_votes_do_not_override_risk_gate(five_fold_protocol):
+    p = five_fold_protocol
+    candidate = report(p, candidate=True)
+    candidate["by_fold"][0]["portfolio"]["max_drawdown"] = .13
+    signals = factor_signal(p)
+    for row in signals[3:]:
+        row["oriented_validation"].update(ic=-.1, icir=-.2)
+    result = compare(report(p), candidate, p, run_id="signal-only",
+                     ablation=report(p), factor_signal_by_fold=signals)
+    assert result.factor_signal_gate["status"] == "passed"
+    assert result.status == "rejected" and "absolute_risk_limit" in result.reasons
+
+
+def test_drawdown_gate_is_independent_of_earlier_risk_trigger(five_fold_protocol):
+    p = five_fold_protocol.model_copy(update={
+        "portfolio": five_fold_protocol.portfolio.model_copy(update={
+            "risk": .08, "max_drawdown_limit": .12})})
+    candidate = report(p, candidate=True)
+    candidate["by_fold"][0]["portfolio"]["max_drawdown"] = .13
+    result = compare(report(p), candidate, p, run_id="independent-drawdown-gate",
+        ablation=report(p), factor_signal_by_fold=factor_signal(p))
+    gate = next(row for row in result.gate_details
+                if row["reason"] == "absolute_risk_limit" and row["fold"] == "A")
+    assert gate["threshold"] == .12
+    assert gate["value"] == .13
+    assert result.status == "rejected"
+
+
+def test_drawdown_trigger_must_not_exceed_acceptance_limit():
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError, match="Drawdown trigger cannot exceed"):
+        PortfolioPolicy(risk_mode="max_drawdown", risk=.13, max_drawdown_limit=.12)
+
+
+def test_icir_vote_rule_is_in_frozen_protocol_identity(protocol):
+    from etf_ml.utils import content_hash
+    payload = protocol.model_dump(mode="json")
+    assert payload.pop("factor_signal_rule") == "strict_majority"
+    assert content_hash(payload) != protocol.protocol_id
+    assert ComparisonProtocol.model_validate_json(protocol.model_dump_json()).protocol_id == protocol.protocol_id
+
+
+@pytest.mark.parametrize("change", [
+    lambda p: p.model_copy(update={"snapshot_id": "different-snapshot"}),
+    lambda p: p.model_copy(update={"baseline_feature_set_id": "different-baseline"}),
+    lambda p: p.model_copy(update={"label": p.label.model_copy(update={"horizon": p.label.horizon + 1})}),
+    lambda p: p.model_copy(update={
+        "universe": p.universe.model_copy(update={"minimum_listing_days": p.universe.minimum_listing_days + 1})}),
+    lambda p: p.model_copy(update={"model": p.model.model_copy(update={
+        "constructor": {**p.model.constructor, "num_leaves": 17}})}),
+    lambda p: p.model_copy(update={
+        "research": p.research.model_copy(update={"seeds": [42, 43, 45]})}),
+    lambda p: p.model_copy(update={
+        "environment": {**p.environment, "identity_test": "different-runtime"}}),
+    lambda p: p.model_copy(update={"source_code_hash": "0" * 64}),
+])
+def test_evaluation_protocol_identity_changes_with_baseline_data_model_or_runtime(protocol, change):
+    assert change(protocol).protocol_id != protocol.protocol_id
+
+
+@pytest.mark.parametrize("runtime_change", ["environment", "source"])
+def test_frozen_protocol_rejects_replay_after_runtime_change(protocol, monkeypatch, runtime_change):
+    import etf_ml.research.protocol as protocol_module
+
+    if runtime_change == "environment":
+        monkeypatch.setattr(protocol_module, "environment_manifest",
+                            lambda: {**protocol.environment, "runtime_test": "changed"})
+    else:
+        monkeypatch.setattr(protocol_module, "code_hash", lambda: "different-source")
+    with pytest.raises(ConfigurationError, match="Frozen comparison runtime changed"):
+        protocol.require_runtime()
 
 
 @pytest.mark.parametrize("problem", ["missing_row", "duplicate_row", "sample_change", "missing_metric",

@@ -38,16 +38,94 @@ def predictive_metrics(scores: pd.Series, labels: pd.Series, *, minimum_cross_se
     by_date = []
     for date, prediction in scores.groupby(level="datetime"):
         target = labels.loc[prediction.index]
-        good = prediction.notna() & target.notna()
+        good = prediction.notna() & target.notna() & np.isfinite(prediction) & np.isfinite(target)
         x, y = prediction[good], target[good]
         valid = len(x) >= minimum_cross_section and x.nunique() > 1 and y.nunique() > 1
-        by_date.append({"date": str(date.date()), "cross_section": len(x), "valid": bool(valid),
+        by_date.append({"date": str(date.date()), "cross_section": len(x),
+                        "eligible_cross_section": len(prediction),
+                        "coverage": float(len(x) / len(prediction)) if len(prediction) else None,
+                        "valid": bool(valid),
                         "ic": float(x.corr(y)) if valid else None,
                         "rank_ic": float(x.corr(y, method="spearman")) if valid else None})
     valid_rows = [row for row in by_date if row["valid"]]
-    return {"ic": float(np.mean([r["ic"] for r in valid_rows])) if valid_rows else None,
-            "rank_ic": float(np.mean([r["rank_ic"] for r in valid_rows])) if valid_rows else None,
-            "effective_dates": len(valid_rows), "by_date": by_date}
+
+    def summarize(key):
+        values = np.asarray([row[key] for row in valid_rows if row[key] is not None], dtype=float)
+        if not len(values):
+            return {"mean": None, "std": None, "ir": None, "positive_share": None,
+                    "direction": "unknown", "ir_status": "no_valid_daily_observations"}
+        mean = float(values.mean())
+        positive_share = float(np.mean(values > 0))
+        if len(values) < 2:
+            std, ir, ir_status = None, None, "fewer_than_two_valid_dates"
+        else:
+            std = float(values.std(ddof=1))
+            if np.isclose(std, 0., rtol=0., atol=1e-12):
+                std = 0.
+                ir, ir_status = None, "zero_daily_standard_deviation"
+            else:
+                ir, ir_status = float(mean / std), "available"
+        direction = ("positive" if mean > 0 and ir is not None and ir > 0 else
+                     "reverse" if mean < 0 and ir is not None and ir < 0 else "unknown")
+        return {"mean": mean, "std": std, "ir": ir, "positive_share": positive_share,
+                "direction": direction, "ir_status": ir_status}
+
+    ic, rank_ic = summarize("ic"), summarize("rank_ic")
+    total = sum(row["eligible_cross_section"] for row in by_date)
+    observed = sum(row["cross_section"] for row in by_date)
+    return {"ic": ic["mean"], "ic_mean": ic["mean"], "ic_std": ic["std"], "icir": ic["ir"],
+            "ic_positive_day_share": ic["positive_share"], "ic_direction": ic["direction"],
+            "icir_status": ic["ir_status"], "rank_ic": rank_ic["mean"],
+            "rank_ic_mean": rank_ic["mean"], "rank_ic_std": rank_ic["std"],
+            "rank_icir": rank_ic["ir"], "rank_ic_positive_day_share": rank_ic["positive_share"],
+            "rank_ic_direction": rank_ic["direction"], "rank_icir_status": rank_ic["ir_status"],
+            "coverage": float(observed / total) if total else None,
+            "effective_dates": len(valid_rows), "total_dates": len(by_date), "by_date": by_date}
+
+
+def select_factor_orientation(training_metrics: dict) -> dict:
+    """Choose direct/reverse orientation from training-only IC and ICIR evidence."""
+    ic, icir = training_metrics.get("ic"), training_metrics.get("icir")
+    finite = all(isinstance(value, (int, float, np.number)) and
+                 not isinstance(value, (bool, np.bool_)) and np.isfinite(value)
+                 for value in (ic, icir))
+    direction = "unknown"
+    if training_metrics.get("icir_status") == "available" and finite:
+        if ic > 0 and icir > 0:
+            direction = "positive"
+        elif ic < 0 and icir < 0:
+            direction = "reverse"
+    sign = 1 if direction == "positive" else -1 if direction == "reverse" else None
+    return {"direction": direction, "sign": sign, "ic": ic, "icir": icir,
+            "effective_dates": training_metrics.get("effective_dates"),
+            "coverage": training_metrics.get("coverage"),
+            "status": training_metrics.get("icir_status", "missing_training_metrics")}
+
+
+def positive_icir_gate(metrics: dict) -> dict:
+    ic, icir = metrics.get("ic"), metrics.get("icir")
+    finite = all(isinstance(value, (int, float, np.number)) and
+                 not isinstance(value, (bool, np.bool_)) and np.isfinite(value)
+                 for value in (ic, icir))
+    if metrics.get("icir_status") != "available" or not finite or ic == 0 or icir == 0:
+        return {"status": "unknown", "reason": "ic_or_icir_unavailable_or_zero"}
+    if ic > 0 and icir > 0:
+        return {"status": "passed", "reason": "ic_and_icir_strictly_positive"}
+    return {"status": "failed", "reason": "ic_or_icir_not_positive"}
+
+
+def summarize_icir_gates(gates: list[dict]) -> dict:
+    """Count each development fold once; unavailable folds never reduce the denominator."""
+    statuses = [gate["status"] for gate in gates]
+    if not statuses or any(status not in {"passed", "failed", "unknown"} for status in statuses):
+        raise ValueError("Invalid factor IC/ICIR fold gates")
+    required = len(statuses) // 2 + 1
+    passed, unknown = statuses.count("passed"), statuses.count("unknown")
+    status = ("passed" if passed >= required else
+              "unknown" if passed + unknown >= required else "failed")
+    return {"rule": "strict_majority", "status": status, "fold_count": len(statuses),
+            "required_pass_folds": required, "passing_folds": passed,
+            "failed_folds": statuses.count("failed"), "unknown_folds": unknown}
 
 
 def position_exposures(positions: dict, universe: pd.DataFrame):

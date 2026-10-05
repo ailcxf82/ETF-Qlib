@@ -7,7 +7,7 @@ from etf_ml.runtime.native import NativeBackend
 
 
 def test_explicit_dotenv_allowlist_and_environment_precedence(tmp_path, monkeypatch):
-    for key in PROVIDER_KEYS:
+    for key in (*PROVIDER_KEYS, "ZHIPUAI_API_KEY", "ZHIPU_MODEL"):
         monkeypatch.delenv(key, raising=False)
     path = tmp_path / ".env"
     path.write_text('CHAT_MODEL="openai/local-model"\nOPENAI_API_KEY=private-value\nUNTRUSTED_OPTION=danger\n')
@@ -18,9 +18,34 @@ def test_explicit_dotenv_allowlist_and_environment_precedence(tmp_path, monkeypa
 
 
 def test_missing_dotenv_does_not_search_generated_directories(tmp_path, monkeypatch):
-    for key in PROVIDER_KEYS:
+    for key in (*PROVIDER_KEYS, "ZHIPUAI_API_KEY", "ZHIPU_MODEL"):
         monkeypatch.delenv(key, raising=False)
     assert provider_environment(tmp_path / "absent") == {}
+
+
+def test_zhipu_process_credential_supersedes_dotenv_openai_credential(tmp_path, monkeypatch):
+    for key in (*PROVIDER_KEYS, "ZHIPUAI_API_KEY", "ZHIPU_MODEL"):
+        monkeypatch.delenv(key, raising=False)
+    path = tmp_path / ".env"
+    path.write_text("OPENAI_API_KEY=stale-dotenv-value\n")
+    monkeypatch.setenv("ZHIPUAI_API_KEY", "rotated-process-value")
+    assert provider_environment(path) == {"OPENAI_API_KEY": "rotated-process-value"}
+
+
+def test_zhipu_model_environment_alias_sets_chat_model(tmp_path, monkeypatch):
+    for key in (*PROVIDER_KEYS, "ZHIPUAI_API_KEY", "ZHIPU_MODEL"):
+        monkeypatch.delenv(key, raising=False)
+    path = tmp_path / ".env"
+    path.write_text("CHAT_MODEL=${ZHIPU_MODEL}\n")
+    monkeypatch.setenv("ZHIPU_MODEL", "zai/glm-test")
+    assert provider_environment(path) == {"CHAT_MODEL": "zai/glm-test"}
+
+
+def test_zhipu_model_without_a_provider_prefix_gets_zai_prefix(tmp_path, monkeypatch):
+    for key in (*PROVIDER_KEYS, "ZHIPUAI_API_KEY", "ZHIPU_MODEL"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("ZHIPU_MODEL", "glm-test")
+    assert provider_environment(tmp_path / "absent") == {"CHAT_MODEL": "zai/glm-test"}
 
 
 def test_child_only_credentials_are_redacted_in_results_and_persisted_logs(tmp_path, monkeypatch):

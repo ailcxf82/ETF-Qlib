@@ -5,17 +5,22 @@ import json
 from rdagent.core.developer import Developer
 
 from etf_ml.adapters.rdagent.experiment import ETFExperiment
-from etf_ml.errors import ETFError, QualityError, BudgetError
+from etf_ml.errors import ETFError, QualityError, BudgetError, ValidationFailure
 from etf_ml.research.code_checks import validate_source
+from etf_ml.research.prompting import build_prompt_context
 from etf_ml.utils import canonical_json, content_hash
 
 
 CODE_SYSTEM = (
-    "Return JSON with source: one Python compute(panel) function. Output one numeric column and preserve "
-    "the full sorted (datetime, instrument) index exactly. For temporal windows use "
+    "Return JSON with source: one Python compute(panel) function. Output one numeric column whose index "
+    "equals the incoming panel.index exactly, including its order. Do not sort the input and return that "
+    "sorted index: if sorting is needed internally for a temporal calculation, reindex the final result to "
+    "panel.index before returning. For temporal windows use "
     "groupby(level='instrument').transform(lambda x: x.rolling(...).<operation>()) so the original "
     "two-level index is retained. Never call groupby(...).rolling(...) directly because it adds an index level. "
-    "No files, network, labels or future data access."
+    "No files, network, labels, future data access, or dynamic builtins such as getattr/setattr. "
+    "Because source validation rejects forbidden-data terms even in docstrings, comments, and string literals, "
+    "do not emit the words label or holdout anywhere in the generated source."
 )
 
 
@@ -29,17 +34,25 @@ class ETFFactorCoder(Developer):
         for task, workspace in zip(exp.sub_tasks, exp.sub_workspace_list):
             source = None
             try:
+                failure = None
                 for repair_attempt in range(2):
                     stage = "code:" + task.name if repair_attempt == 0 else "code_repair:" + task.name
-                    prompt = {"context": workspace.context, "factor": task.proposal,
-                              "allowed_libraries": ["numpy", "pandas", "math", "statistics"]}
+                    v2 = getattr(workspace.context, "prompt_version", "etf-factor-v1") == "etf-factor-v2"
+                    prompt = (build_prompt_context(workspace.context, stage, current_proposal=task.proposal)
+                              if v2 else {"context": workspace.context, "factor": task.proposal,
+                                          "allowed_libraries": ["numpy", "pandas", "math", "statistics"]})
                     if repair_attempt:
-                        prompt.update({
-                            "original_source": source,
-                            "validation_error": validation_error,
-                            "instruction": "Return corrected JSON only. Preserve the factor's intended "
-                                           "causal definition and the original two-level index exactly.",
-                        })
+                        if hasattr(self.scen.session, "claim_repair") and not self.scen.session.claim_repair("code"):
+                            raise QualityError("Repair quota exhausted for code")
+                        repair = {"source": source, "failure": failure.prompt_payload(),
+                                  "instruction": "Return corrected JSON only. Preserve the factor's intended "
+                                                 "causal definition and the incoming panel.index exactly, including "
+                                                 "order. If computation sorts internally, reindex its final output "
+                                                 "to panel.index before returning."}
+                        prompt = (build_prompt_context(workspace.context, stage, current_proposal=task.proposal,
+                                                       repair=repair) if v2 else {**prompt, "original_source": source,
+                                                       "validation_error": validation_error,
+                                                       "instruction": repair["instruction"]})
                     text = self.scen.session.llm.complete(
                         stage=stage,
                         system_prompt=CODE_SYSTEM,
@@ -49,20 +62,31 @@ class ETFFactorCoder(Developer):
                                           "repair_attempt": repair_attempt,
                                           **({"original_source_hash": content_hash(source)} if repair_attempt else {})},
                     )
-                    source = json.loads(text).get("source")
-                    if not isinstance(source, str) or not source:
-                        validation_error = "Coder did not return a compute implementation"
-                    else:
+                    try:
+                        payload = json.loads(text)
+                        source = payload.get("source")
+                        if not isinstance(source, str) or not source:
+                            raise ValidationFailure(category="json_format", check_id="coder_source",
+                                                    message="Coder did not return a compute implementation")
                         try:
                             validate_source(source)
                         except QualityError as exc:
-                            validation_error = str(exc)
-                        else:
-                            workspace.inject_files(**{"factor.py": source})
-                            workspace.execute()
-                            break
-                    if repair_attempt:
-                        raise QualityError(validation_error)
+                            message = str(exc)
+                            fatal = any(marker in message.lower() for marker in
+                                        ("future", "forbidden", "file access", "dynamic execution", "centered"))
+                            raise ValidationFailure(category="causal_violation" if fatal else "syntax",
+                                                    check_id="source_validation", message=message,
+                                                    recoverable=not fatal) from exc
+                        workspace.inject_files(**{"factor.py": source})
+                        workspace.execute()
+                        break
+                    except ValidationFailure as exc:
+                        failure = exc
+                    except (ValueError, KeyError, TypeError) as exc:
+                        failure = ValidationFailure(category="json_format", check_id="coder_response",
+                                                    message="Coder response is not valid JSON", recoverable=True)
+                    if not failure.recoverable or repair_attempt:
+                        raise failure
             except BudgetError:
                 raise
             except (ETFError, ValueError, KeyError) as exc:

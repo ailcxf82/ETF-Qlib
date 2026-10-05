@@ -54,6 +54,23 @@ def run(values):
     return development_diagnostics(*values)
 
 
+def test_new_signal_chain_summary_reaches_prompt_without_paths_or_raw_scores():
+    from etf_ml.adapters.rdagent.feedback import compact_diagnostics
+    from etf_ml.research.prompting import _signal_summary
+    compact = compact_diagnostics({'signal_to_execution': {'status': 'completed', 'by_fold': [
+        {'fold': 'A', 'seed': 42, 'prediction_change': {'status': 'completed',
+            'compared_rows': 100, 'changed_rows': 20, 'raw_scores': 'DO_NOT_FORWARD'},
+         'model_feature_entry': {'status': 'completed', 'model_path': 'DO_NOT_FORWARD'},
+         'risk_only_decisions': {'baseline': 2, 'candidate': 3}}]}})
+    row = compact['signal_to_execution']['by_fold'][0]
+    assert row['model_feature_entry_status'] == 'completed'
+    summary = _signal_summary([row])
+    assert summary['prediction_changed_rows'] == 20
+    assert summary['prediction_compared_rows'] == 100
+    assert summary['candidate_risk_only_decisions'] == 3
+    assert 'DO_NOT_FORWARD' not in canonical_json(compact)
+
+
 def test_reports_exact_correlations_costs_and_common_decay_sample(observations):
     result = run(observations)
     factor = result['predictive_metrics']['factor_by_fold'][0]
@@ -62,9 +79,9 @@ def test_reports_exact_correlations_costs_and_common_decay_sample(observations):
     assert result['factor_diagnostics']['redundancy']['opposite'] == pytest.approx(1.)
     assert [r['effective_dates'] for r in result['factor_diagnostics']['stability']] == [27, 27]
     decay = result['factor_diagnostics']['decay']
-    assert [r['horizon'] for r in decay] == [1, 5, 10]
-    assert {r['common_sample_rows'] for r in decay} == {49 * 3}
-    assert {r['effective_dates'] for r in decay} == {49}
+    assert [r['horizon'] for r in decay] == [1, 5, 10, 20]
+    assert {r['common_sample_rows'] for r in decay} == {39 * 3}
+    assert {r['effective_dates'] for r in decay} == {39}
     assert result['data_quality']['by_fold'][0]['coverage'] == pytest.approx(.9)
     assert result['data_quality']['by_fold'][0]['worst_date_coverage'] == 0.
     assert result['data_quality']['by_fold'][0]['by_group']['equity'] == pytest.approx(.9)
@@ -95,14 +112,19 @@ def test_diagnostics_reject_unsafe_or_different_samples(observations, problem):
         run(args)
 
 
-def test_ineligible_members_and_unrelated_training_rows_do_not_pollute_factor_diagnostics(observations):
+def test_training_changes_only_affect_frozen_orientation_not_validation_observations(observations):
     panel, calendar, universe, baseline, factor, protocol, reports = copy.deepcopy(observations)
-    # Training-only changes cannot affect any reported selection-period diagnostic.
     expected = run((panel, calendar, universe, baseline, factor, protocol, reports))
     training = panel.index.get_level_values('datetime') < calendar[120]
     baseline.frame.loc[training, 'opposite'] = 1e9
     factor.frame.loc[training, 'factor'] = -1e9
-    assert run((panel, calendar, universe, baseline, factor, protocol, reports)) == expected
+    changed = run((panel, calendar, universe, baseline, factor, protocol, reports))
+    old_row = expected['predictive_metrics']['factor_by_fold'][0]
+    new_row = changed['predictive_metrics']['factor_by_fold'][0]
+    assert {key: old_row[key] for key in ('ic', 'ic_std', 'icir', 'rank_ic', 'rank_icir', 'by_date')} == {
+        key: new_row[key] for key in ('ic', 'ic_std', 'icir', 'rank_ic', 'rank_icir', 'by_date')}
+    assert new_row['training_orientation']['direction'] == 'unknown'
+    assert new_row['oriented_validation_gate']['status'] == 'unknown'
 
 
 def test_constant_cross_section_has_unknown_ic_not_fabricated_zero(observations):
@@ -167,6 +189,9 @@ def test_observations_cannot_promote_rejected_candidate(observations):
     assert row['status'] == 'rejected'
     assert row['direction'] == 'negative' and row['applicable_scope'] == 'domestic_equity'
     assert row['group_paired_deltas'][0]['excess_return'] == .02
+    summary = result.structured['summary']['by_candidate'][0]
+    assert summary['decision_reasons'] == ['all_frozen_gates_passed']
+    assert summary['coverage'] == pytest.approx(.97)
 
 
 def test_missing_diagnostics_and_nonfinite_fields_stay_unknown():
@@ -178,3 +203,40 @@ def test_missing_diagnostics_and_nonfinite_fields_stay_unknown():
     assert result['predictive_metrics']['factor_by_fold'][0]['ic'] is None
     assert result['predictive_metrics']['factor_by_fold'][0]['rank_ic'] == 0.
     canonical_json(result)
+
+
+def test_feedback_summary_attributes_risk_against_frozen_policy_threshold():
+    from etf_ml.adapters.rdagent.feedback import feedback_summary
+    payload = {'status': 'rejected', 'risk_policy': {'mode': 'max_drawdown', 'limit': .12},
+               'by_candidate': [{'factor_id': 'example', 'status': 'rejected',
+                   'reasons': ['absolute_risk_limit'], 'paired_deltas': [{'fold': 'F', 'seed': 1, 'excess_return': .01}],
+                   'observations': {'portfolio_metrics': {'by_fold': [{'fold': 'F', 'seed': 1,
+                       'baseline': {'max_drawdown': .13}, 'candidate': {'max_drawdown': .14}}]}}}]}
+    row = feedback_summary(payload)['by_candidate'][0]
+    assert row['risk']['by_fold'][0]['baseline_breach'] is True
+    assert row['risk']['by_fold'][0]['candidate_breach'] is True
+    assert row['next_action'] == 'inherited_baseline_risk_review'
+
+
+def test_feedback_summary_keeps_cost_stress_risk_by_fold_and_seed():
+    from etf_ml.adapters.rdagent.feedback import feedback_summary
+    payload = {'risk_policy': {'mode': 'max_drawdown', 'limit': .12}, 'by_candidate': [{
+        'factor_id': 'example', 'status': 'rejected', 'observations': {
+            'data_quality': {'time_check': 'passed'},
+            'portfolio_metrics': {'by_fold': []}, 'robustness': {'cost_stress': [{
+                'fold': 'F', 'seed': 7, 'multiplier': 2.,
+                'baseline': {'max_drawdown': .13, 'excess_return': .02, 'total_execution_cost': 10.},
+                'candidate': {'max_drawdown': .14, 'excess_return': -.01, 'total_execution_cost': 13.}}]}},
+        'group_ablation': {'status': 'rejected', 'group': 'trend', 'reasons': ['ablation_not_confirmed']},
+        'group_paired_deltas': [{'fold': 'F', 'seed': 7, 'excess_return': -.02}],
+        'signal_to_execution': {'status': 'partial'}}]}
+    row = feedback_summary(payload)['by_candidate'][0]
+    risk = row['risk']['by_fold'][0]
+    assert risk['scenario'] == 'cost_stress:2.0'
+    assert risk['fold'] == 'F' and risk['seed'] == 7
+    assert risk['baseline_breach'] is True and risk['candidate_breach'] is True
+    stress = row['cost_stress'][0]
+    assert stress['excess_return_delta'] == pytest.approx(-.03)
+    assert stress['execution_cost_delta'] == pytest.approx(3.)
+    assert row['group_ablation']['status'] == 'rejected'
+    assert row['unknown_evidence'] == ['signal_to_execution_evidence_partial']

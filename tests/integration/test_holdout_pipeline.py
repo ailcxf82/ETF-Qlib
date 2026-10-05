@@ -17,7 +17,7 @@ from etf_ml.research.protocol import ComparisonProtocol
 from etf_ml.research.session import ResearchSession
 from etf_ml.validation import holdout
 from etf_ml.validation.usage import HoldoutUsageStore
-from etf_ml.utils import file_hash, source_hashes
+from etf_ml.utils import atomic_json, file_hash, source_hashes
 
 pytestmark = pytest.mark.qlib
 
@@ -57,12 +57,24 @@ def test_actual_independent_holdout_retries_then_caches_fixed_model_and_blocks_o
     selected = freeze_model(config, feature_freeze["freeze_path"], comparison_path,
         model="ridge", fold="fixture", seed=42, reason="Synthetic fixed choice before holdout", run_id="freeze")
     package_path = Path(selected["frozen_model_path"])
+    access_source, access_audit = tmp_path / "access-history.json", tmp_path / "access-audit.json"
+    atomic_json(access_source, {"scope": "Synthetic fixture, generated for this test only"})
+    atomic_json(access_audit, {"schema_version": "holdout-access-audit-v2", "start": boundary,
+        "end": snapshot.manifest["cutoff"], "snapshot_id": snapshot.snapshot_id,
+        "snapshot_manifest_sha256": file_hash(snapshot.path / "snapshot_manifest.json"),
+        "history_complete": True, "prior_selection_use": False, "prior_result_access": False,
+        "reviewer": "synthetic-fixture", "reviewed_at": "2020-01-01T00:00:00Z",
+        "sources": [{"path": str(access_source), "sha256": file_hash(access_source)}]})
+    with pytest.raises(ConfigurationError, match="access review required"):
+        holdout.evaluate_holdout(config, package_path, run_id="unreviewed")
+    assert not (config.artifact_root / "final_acceptance/usage").exists()
     research_before = source_hashes(session.root)
     weights_before = {p: file_hash(p) for p in config.artifact_root.rglob("bundle.pkl")}
     original_run = holdout.NativeBackend.run
     monkeypatch.setattr(holdout.NativeBackend, "run", lambda *args, **kwargs:
         ExecutionResult(status="failed", returncode=None, stdout="", stderr="", duration_seconds=0., reason="timeout"))
-    with pytest.raises(ExecutionError): holdout.evaluate_holdout(config, package_path, run_id="technical-retry")
+    with pytest.raises(ExecutionError):
+        holdout.evaluate_holdout(config, package_path, run_id="technical-retry", access_audit=access_audit)
     usage = HoldoutUsageStore(config.artifact_root / "final_acceptance/usage")
     claim_path = next((usage.root / "claims").glob("*.json"))
     usage_id = json.loads(claim_path.read_text())["usage_id"]
@@ -71,7 +83,8 @@ def test_actual_independent_holdout_retries_then_caches_fixed_model_and_blocks_o
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump(config.model_dump(mode="json")), encoding="utf-8")
     capsys.readouterr()
-    args = ["evaluate-holdout", "--config", str(config_path), "--frozen-model", str(package_path), "--run-id", "holdout-cli"]
+    args = ["evaluate-holdout", "--config", str(config_path), "--frozen-model", str(package_path),
+            "--holdout-access-audit", str(access_audit), "--run-id", "holdout-cli"]
     # If decision publication is interrupted after the actual portfolio run,
     # resume from that immutable report instead of evaluating the data again.
     from etf_ml.registry.model_versions import ModelVersionRegistry
@@ -109,15 +122,20 @@ def test_actual_independent_holdout_retries_then_caches_fixed_model_and_blocks_o
     manifest_time = (artifact / "manifest.json").stat().st_mtime_ns
     assert main(args) == (0 if expected_status == "passed" else 5)
     assert json.loads(capsys.readouterr().out)["reused"]
-    cached = holdout.evaluate_holdout(config, package_path, run_id="new-name-same-version")
+    cached = holdout.evaluate_holdout(config, package_path, run_id="new-name-same-version", access_audit=access_audit)
     assert cached["reused"] and cached["artifact_path"] == str(artifact)
     assert (artifact / "manifest.json").stat().st_mtime_ns == manifest_time
     alternative = freeze_model(config, feature_freeze["freeze_path"], comparison_path,
         model="lightgbm", fold="fixture", seed=43, reason="Synthetic alternative fixed choice", run_id="alternative")
     with pytest.raises(ConfigurationError, match="already consumed"):
-        holdout.evaluate_holdout(config, Path(alternative["frozen_model_path"]), run_id="forbidden-reuse")
+        holdout.evaluate_holdout(config, Path(alternative["frozen_model_path"]), run_id="forbidden-reuse", access_audit=access_audit)
     _verify_actual_daily_and_complete_version_restore(config, source_spec, snapshot, config_path, package_path,
         Path(alternative['frozen_model_path']), calendar, tmp_path, capsys, monkeypatch, expected_status)
+    original_access = access_source.read_bytes()
+    atomic_json(access_source, {"tampered": True})
+    assert main(args) == 5  # Cached CLI results must revalidate the review sources too.
+    capsys.readouterr()
+    access_source.write_bytes(original_access)
     # Successful/failed command reuse always rechecks the actual ledger files.
     trades = artifact / "portfolio/trades.parquet"
     trades.write_bytes(trades.read_bytes() + b"corrupt")

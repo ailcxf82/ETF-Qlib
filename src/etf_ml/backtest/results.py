@@ -44,22 +44,30 @@ def persist_result(result, output: Path):
         "gross_income", "booked_income", "unallocated_rounding_residual", "converted_shares", "conversion_cash",
         "unpaid_before", "unpaid_after", "cash_settled"]).to_parquet(output / "income_postings.parquet", index=False)
     atomic_json(output / "decisions.json", result.decisions)
+    atomic_json(output / "risk_checks.json", result.risk_checks)
     result.exposures.to_parquet(output / "exposures.parquet")
     result.execution.to_parquet(output / "execution.parquet")
     result.ledger.to_parquet(output / 'ledger.parquet')
 
 
-def evaluate_with_stress(scores, policy, panel, *, output, cost_multipliers=(2.0,), **kwargs):
+def evaluate_with_stress(scores, policy, panel, *, output, cost_multipliers=(2.0,),
+                         phase_callback=None, **kwargs):
     if (len(set(cost_multipliers)) != len(cost_multipliers) or
             any(isinstance(m, bool) or not isinstance(m, (int, float)) or
                 not math.isfinite(m) or m <= 1 for m in cost_multipliers)):
         raise ConfigurationError("Cost pressure multipliers must be distinct finite values above one")
     if any(m * max(policy.commission_rate, policy.slippage_rate) >= 1 for m in cost_multipliers):
         raise ConfigurationError("Cost pressure produces an invalid rate")
+    if phase_callback:
+        phase_callback("base_started")
     base = evaluate(scores, policy, panel, **kwargs)
     persist_result(base, output)
+    if phase_callback:
+        phase_callback("base_completed")
     stress_metrics = {}
     for multiplier in cost_multipliers:
+        if phase_callback:
+            phase_callback("cost_stress_started", multiplier=multiplier)
         stressed = policy.model_copy(deep=True)
         stressed.commission_rate *= multiplier
         stressed.minimum_commission *= multiplier
@@ -69,4 +77,6 @@ def evaluate_with_stress(scores, policy, panel, *, output, cost_multipliers=(2.0
         persist_result(result, path)
         atomic_json(path / "metrics.json", result.metrics)
         stress_metrics[str(multiplier)] = result.metrics
+        if phase_callback:
+            phase_callback("cost_stress_completed", multiplier=multiplier)
     return base, stress_metrics

@@ -1,0 +1,12 @@
+{
+  "schema_version": "historical-accounting-policy-v1",
+  "campaign_id": "formal-five-20260924",
+  "event_chain_head": "4a7c20ad10082afb35456d05c760d97893ca043f9de7ea2f9906ecdc53bac9cf",
+  "decision": "defer_historical_reconciliation",
+  "approved_by": "user",
+  "approved_on": "2026-09-26",
+  "approval_text": "历史费用暂不追补，未来改善采集，研究门槛不放松",
+  "unknown_cost_action": "retain_unknown",
+  "release_attempt_slots": false,
+  "relax_research_gates": false
+}
